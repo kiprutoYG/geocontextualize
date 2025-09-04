@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+httpx
+rasterio
+numpy
+pystac-client
+odc-stac
+planetary-computer
