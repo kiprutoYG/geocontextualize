@@ -157,7 +157,7 @@ export default function Home() {
   // 1. Elevation context
   if (dem) {
     lines.push(
-      `Elevation: averages around ${dem.mean.toFixed(0)} m (range: ${dem.min}–${dem.max} m, σ ${dem.std.toFixed(1)}).`
+      `Elevation: averages around ${dem.mean.toFixed(0)} m (range: ${dem.min}–${dem.max} m, Standard deviation of ${dem.std.toFixed(1)}).`
     );
   }
 
@@ -171,7 +171,7 @@ export default function Home() {
   // 3. Vegetation NDVI context
   if (ndvi?.annual_mean != null) {
     lines.push(
-      `Vegetation health: moderate (NDVI ≈ ${ndvi.annual_mean.toFixed(2)}, scale -1 to +1).`
+      `Vegetation health: (NDVI ≈ ${ndvi.annual_mean.toFixed(2)}, on a scale -1 to +1).`
     );
   }
 
@@ -213,7 +213,7 @@ export default function Home() {
     setResponse('');
 
     try {
-      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'https://geocontextualize.onrender.com/';
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'https://geocontextualize.onrender.com';
       let geojson;
       // Construct GeoJSON polygon from boundingBox
       if (uploadedGeojson) {
@@ -280,9 +280,8 @@ export default function Home() {
       // ✅ Now parse only the final JSON payload
       if(!jsonString) throw new Error("No JSON summary received");
       const data = JSON.parse(jsonString); 
-      setResponse(JSON.stringify(data, null, 2)); 
-      const summary = summarizeData(data.summary);
-      setSummaryText(summary);
+      setResponse(summarizeData(data.summary)); 
+      setSummaryText(summarizeData(data));
       } catch (err) {
         console.error(err);
         setSummaryText("Error: " + (err as Error).message);
