@@ -6,9 +6,10 @@ import "leaflet-draw";
 import "leaflet/dist/leaflet.css";
 import "leaflet-draw/dist/leaflet.draw.css";
 import L from "leaflet";
-import "leaflet-graticule"; // for graticules
+import "leaflet-graticule"; 
 
 // Fix default marker icons
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl:
@@ -48,6 +49,7 @@ function MapController({
 
   useEffect(() => {
     // Add graticule overlay
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (L as any).latlngGraticule({
       showLabel: true,
       opacity: 0.6,
@@ -90,6 +92,7 @@ function MapController({
       map.addControl(drawControl);
 
       // Handle draw events
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       map.on(L.Draw.Event.CREATED, (e: any) => {
         const { layer } = e;
 

@@ -7,6 +7,8 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Feature, FeatureCollection, Geometry } from "geojson";
+
 
 // Dynamic imports to avoid SSR issues with Leaflet
 const MapComponent = dynamic(() => import('@/components/MapComponent'), {
@@ -47,7 +49,8 @@ export default function Home() {
   const [response, setResponse] = useState<string>('');
   const [isSearching, setIsSearching] = useState(false);
   const searchTimeout = useRef<NodeJS.Timeout | null>(null);
-  const [uploadedGeojson, setUploadedGeojson] = useState<any>(null);
+  const [uploadedGeojson, setUploadedGeojson] = useState<Feature<Geometry> | FeatureCollection<Geometry> | null>(null);
+
 
   // Search for places using Nominatim
   const searchPlaces = async (query: string) => {
@@ -119,7 +122,33 @@ export default function Home() {
     reader.readAsText(file);
   };
   //summarize data function
-  function summarizeData(summary: any): string {
+  interface DemStats {
+  mean: number;
+  min: number;
+  max: number;
+  std: number;
+  }
+
+  interface TemperatureStats {
+    annual_mean_C: number;
+  }
+
+  interface NdviStats {
+    annual_mean: number;
+  }
+
+  interface LandcoverStats {
+    [code: string]: number; // e.g. { "10": 23.71, "20": 36.9 }
+  }
+
+  interface Summary {
+    dem?: DemStats;
+    temperature?: TemperatureStats;
+    ndvi?: NdviStats;
+    landcover?: LandcoverStats;
+  }
+
+  function summarizeData(summary: Summary): string {
   if (!summary) return "No summary available.";
 
   const { dem, temperature, ndvi, landcover } = summary;
@@ -165,7 +194,7 @@ export default function Home() {
     const parts: string[] = [];
     for (const [code, pct] of Object.entries(landcover)) {
       const label = classMap[code] || `Class ${code}`;
-      parts.push(`${label} (${(+pct).toFixed(1)}%)`);
+      parts.push(`${label} (${(+pct).toFixed(2)}%)`);
     }
     if (parts.length > 0) {
       lines.push(`Land cover composition: ${parts.join(", ")}.`);
@@ -229,6 +258,7 @@ export default function Home() {
         const { done, value } = await reader.read();
         if (done) break;
         const chunk = decoder.decode(value, { stream: true });
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
         fullText += chunk;
 
         // Each SSE message is separated by newlines
@@ -238,7 +268,6 @@ export default function Home() {
 
             try {
               // Check if it's valid JSON (the final summary)
-              const parsed = JSON.parse(msg);
               jsonString = msg; // save final JSON string
             } catch {
               // Not JSON (just a progress message), ignore
@@ -482,7 +511,7 @@ export default function Home() {
                     <div className="flex items-center justify-center h-48 text-slate-400">
                       <div className="text-center">
                         <Satellite className="w-12 h-12 mx-auto mb-3 opacity-50" />
-                        <p>Select an area on the map and click "Analyze Area" to see results</p>
+                        <p>Select an area on the map and click &quot;Analyze Area&quot; to see results</p>
                       </div>
                     </div>
                   )}
