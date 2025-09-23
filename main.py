@@ -14,8 +14,16 @@ import asyncio
 import json
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Union, List, Dict
+import sentry_sdk
 import geopandas as gpd
 from shapely.geometry import shape, mapping, box
+
+sentry_sdk.init(
+    dsn="https://f3b3208c800a9df29c5e72da1b28fb1a@o4509989478596608.ingest.de.sentry.io/4509989482397776",
+    # Add data like request headers and IP for users,
+    # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
+    send_default_pii=True,
+)
 
 
 app = FastAPI(title="GeoContext Generator API")

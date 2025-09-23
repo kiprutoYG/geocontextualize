@@ -6,3 +6,6 @@ numpy
 pystac-client
 odc-stac
 planetary-computer
+sentry-sdk
+geopandas
+shapely
