@@ -1,8 +1,8 @@
 "use client";
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useRef } from 'react';
 import dynamic from 'next/dynamic';
-import { Search, Copy, MapPin, Loader2, Globe, Satellite } from 'lucide-react';
+import { Search, MapPin, Loader2, Globe, Satellite } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -158,7 +158,7 @@ export default function Home() {
   function summarizeData(summary: Summary): string {
   if (!summary) return "No summary available.";
 
-  const { dem, temperature, ndvi, landcover } = summary;
+  const { dem, ndvi, landcover } = summary;
   const lines: string[] = [];
 
   // 1. Elevation context
