@@ -150,7 +150,7 @@ export default function Home() {
 
   interface Summary {
     dem?: DemStats;
-    temperature?: TemperatureStats;
+    // temperature?: TemperatureStats;
     ndvi?: NdviStats;
     landcover?: LandcoverStats;
   }
