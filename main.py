@@ -13,6 +13,17 @@ from fastapi.responses import StreamingResponse
 import asyncio
 import json
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Union, List, Dict
+import sentry_sdk
+import geopandas as gpd
+from shapely.geometry import shape, mapping, box
+
+sentry_sdk.init(
+    dsn="https://f3b3208c800a9df29c5e72da1b28fb1a@o4509989478596608.ingest.de.sentry.io/4509989482397776",
+    # Add data like request headers and IP for users,
+    # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
+    send_default_pii=True,
+)
 
 
 app = FastAPI(title="GeoContext Generator API")
@@ -66,18 +77,33 @@ async def query_stac(collection: str, geojson: dict, limit: int = 1, time_range:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STAC query failed: {str(e)}")
 
-def compute_raster_stats(asset_href: str, geojson: dict) -> Dict[str, float]:
-    """Download raster, clip to geojson, compute stats.
-    Arguments:
-        asset_href (str): The URL of the raster asset to download.
-        geojson (dict): The GeoJSON geometry to clip the raster to.
-
-    Returns:
-        Dict[str, float]: A dictionary of computed statistics.
-    """
+def compute_raster_stats(asset_href: Union[str, List[str]], geojson: dict) -> Dict[str, float]:
     try:
-        signed_url = planetary_computer.sign(asset_href)
-        with rasterio.Env():
+        if isinstance(asset_href, list):
+            stats = []
+            for href in asset_href:
+                signed_url = planetary_computer.sign(href)
+                with rasterio.open(signed_url) as src:
+                    clipped, _ = mask(src, [geojson["geometry"]], crop=True, nodata=src.nodata)
+                    arr = clipped[0].astype(float)
+                    arr[arr == src.nodata] = np.nan
+                    stats.append({
+                        "mean": float(np.nanmean(arr)),
+                        "min": float(np.nanmin(arr)),
+                        "max": float(np.nanmax(arr)),
+                        "std": float(np.nanstd(arr)),
+                    })
+            return {
+                "per_scene": stats,
+                "aggregate": {
+                    "mean": float(np.nanmean([s["mean"] for s in stats])),
+                    "min": float(np.nanmin([s["min"] for s in stats])),
+                    "max": float(np.nanmax([s["max"] for s in stats])),
+                    "std": float(np.nanmean([s["std"] for s in stats])),
+                }
+            }
+        else:
+            signed_url = planetary_computer.sign(asset_href)
             with rasterio.open(signed_url) as src:
                 clipped, _ = mask(src, [geojson["geometry"]], crop=True, nodata=src.nodata)
                 arr = clipped[0].astype(float)
@@ -111,11 +137,102 @@ def compute_landcover_percentages(asset_href: str, geojson: dict) -> Dict[str, f
             return {str(k): round((v / total) * 100, 2) for k, v in counts.items()}
     except Exception as e:
         return {"error": str(e)}
+    
+def normalize_geojson(geojson: dict) -> dict:
+    if geojson.get("type") == "FeatureCollection":
+        return geojson["features"][0]
+    elif geojson.get("type") == "Feature":
+        return geojson
+    raise HTTPException(400, "Unsupported GeoJSON type")
+
+def safe_stats(arr: np.ndarray) -> Dict[str, float]:
+    if arr.size == 0 or np.all(np.isnan(arr)):
+        return {
+            "mean": None,
+            "min": None,
+            "max": None,
+            "std": None,
+            "note": "All pixels nodata or AOI too small"
+        }
+    return {
+        "mean": float(np.nanmean(arr)),
+        "min": float(np.nanmin(arr)),
+        "max": float(np.nanmax(arr)),
+        "std": float(np.nanstd(arr)),
+    }
+
+
+def calculate_ndvi(red: np.ndarray, nir: np.ndarray) -> np.ndarray:
+    ndvi = (nir - red) / (nir + red + 1e-6)  # add epsilon to avoid div by zero
+    ndvi[np.isinf(ndvi)] = np.nan
+    return ndvi
+
+def compute_modis_ndvi(item, geom):
+    """Compute NDVI stats for a MODIS MOD13A1 item clipped to AOI."""
+    try:
+        ndvi_href = planetary_computer.sign(item.assets["500m_16_days_NDVI"].href)
+
+        with rasterio.open(ndvi_href) as src:
+            # Reproject AOI to MODIS CRS
+            raster_crs = src.crs
+            gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326").to_crs(raster_crs)
+            geom_reproj = mapping(gdf.iloc[0].geometry)
+
+            # Clip raster
+            clipped, _ = mask(src, [geom_reproj], crop=True)
+            arr = clipped[0].astype("float32")
+            if arr.size == 0 or np.all(np.isnan(arr)):
+                return {"mean": None, "min": None, "max": None, "std": None}
+            else:
+                # MODIS NDVI: nodata = -3000, valid -2000 → 10000
+                arr[arr <= -2000] = np.nan
+
+                if np.all(np.isnan(arr)):
+                    return {"mean": np.nan, "min": np.nan, "max": np.nan, "std": np.nan}
+
+                # Apply scale factor
+                ndvi = arr * 0.0001
+
+                return {
+                    "mean": float(np.nanmean(ndvi)),
+                    "min": float(np.nanmin(ndvi)),
+                    "max": float(np.nanmax(ndvi)),
+                    "std": float(np.nanstd(ndvi)),
+                }
+    except Exception as e:
+        return {"error": str(e)}
+def compute_modis_lst(item, geom, to_celsius: bool = True) -> Dict[str, float]:
+    """Compute MODIS LST stats (MOD11A1) for AOI."""
+    try:
+        lst_href = planetary_computer.sign(item.assets["LST_Day_1km"].href)
+        with rasterio.open(lst_href) as src:
+            raster_crs = src.crs
+            gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326").to_crs(raster_crs)
+            geom_reproj = mapping(gdf.iloc[0].geometry)
+
+            clipped, _ = mask(src, [geom_reproj], crop=True)
+            arr = clipped[0]
+
+            # MOD11A1 scale factor: 0.02, values in Kelvin
+            stats = safe_stats(arr, scale=0.02)
+
+            if stats["mean"] is not None and to_celsius:
+                # Convert from Kelvin to Celsius
+                for k in ["mean", "min", "max"]:
+                    if stats[k] is not None:
+                        stats[k] = stats[k] - 273.15
+
+            return stats
+    except Exception as e:
+        return {"error": str(e)}
+
 
 # ----------- API Endpoint ------------ #
 @app.post("/generate-context")
 async def generate_context(request: GeoJSONRequest):
-    geojson = request.geojson
+    """Generate geospatial context for a given GeoJSON polygon."""
+    
+    geojson = normalize_geojson(request.geojson)
 
     coords = geojson["geometry"]["coordinates"][0]
     xs = [c[0] for c in coords]
@@ -129,33 +246,98 @@ async def generate_context(request: GeoJSONRequest):
     catalog = pystac_client.Client.open(STAC_URL, modifier=planetary_computer.sign_inplace)
 
     async def event_stream():
-        yield "data: Searching available imagery...\n\n"
-
         # DEM
-        yield "data: Searching DEM dataset...\n\n"
-        dem_items = list(catalog.search(collections=["nasadem"], bbox=bbox, limit=1).get_items())
-        dem_stats = compute_raster_stats(dem_items[0].assets["elevation"].href, geojson) if dem_items else {}
+        dem_items = list(catalog.search(collections=["nasadem"], bbox=bbox, limit=1).items())
+        dem_href = dem_items[0].assets["elevation"].href if dem_items else None
 
-        # LST
-        yield "data: Searching LST (MODIS)...\n\n"
-        lst_items = list(catalog.search(collections=["modis-11A2-061"], bbox=bbox, datetime=time_range, limit=12).get_items())
-        lst_stats = {"annual_mean_C": 25.0} if lst_items else {}
+        # # LST
+        # months = {
+        #     "March": "03",
+        #     "June": "06",
+        #     "September": "09",
+        #     "December": "12",
+        # }
+        # items = {}
+        # for name, number in months.items():
+        #     datetime = f"{last_year}-{number}"
+        #     search = catalog.search(
+        #         collections=["modis-11A1-061"],  # MOD11A1: Daily LST 1km
+        #         bbox=bbox,
+        #         datetime=datetime,
+        #     )
+        #     try:
+        #         items[name] = next(search.items())
+        #     except StopIteration:
+        #         print(f"No MODIS LST found for {name} {last_year}")
 
+        # results = {}
+        # aoi_geom = box(*bbox)
+        # for month, item in items.items():
+        #     results[month] = compute_modis_lst(item, aoi_geom)
+
+        # # Yearly average
+        # valid = [r for r in results.values() if "mean" in r and r["mean"] is not None]
+        # if valid:
+        #     yearly_lst = {
+        #         "mean": float(np.nanmean([r["mean"] for r in valid])),
+        #         "min": float(np.nanmin([r["min"] for r in valid])),
+        #         "max": float(np.nanmax([r["max"] for r in valid])),
+        #         "std": float(np.nanmean([r["std"] for r in valid])),
+        #     }
         # NDVI
-        yield "data: Searching NDVI (MODIS)...\n\n"
-        ndvi_items = list(catalog.search(collections=["modis-13A1-061"], bbox=bbox, datetime=time_range, limit=12).get_items())
-        ndvi_stats = {"annual_mean": 0.42} if ndvi_items else {}
+        yield "data: Searching NDVI (Sentinel2)...\n\n"
+        months = {
+        "January": "01",
+        "April": "04",
+        "July": "07",
+        "October": "10",
+        }
+        items = {}
+        # Get 1 MODIS scene per chosen month
+        for name, number in months.items():
+            datetime = f"{last_year}-{number}"
+            search = catalog.search(
+                collections=["modis-13A1-061"],  # MOD13A1: 16-day NDVI, 500m
+                bbox=bbox,
+                datetime=datetime,
+            )
+            try:
+                items[name] = next(search.items())  # first available scene in that month
+            except StopIteration:
+                print(f"No MODIS NDVI found for {name} {last_year}")
 
+        # -------------------
+        # Compute stats for each quarter
+        results = {}
+        aoi_geom = box(*bbox) # bounding box polygon
+        for month, item in items.items():
+            stats = compute_modis_ndvi(item, aoi_geom)
+            results[month] = stats
+
+        # Optional: compute yearly average stats
+        valid = [r for r in results.values() if "mean" in r]
+        if valid:
+            yearly_stats = {
+                "mean": float(np.nanmean([r["mean"] for r in valid])),
+                "min": float(np.nanmin([r["min"] for r in valid])),
+                "max": float(np.nanmax([r["max"] for r in valid])),
+                "std": float(np.nanmean([r["std"] for r in valid])),
+            }
         # Landcover
         yield "data: Analyzing landcover...\n\n"
-        lc_items = list(catalog.search(collections=["esa-worldcover"], bbox=bbox, limit=1).get_items())
-        lc_stats = compute_landcover_percentages(lc_items[0].assets["map"].href, geojson) if lc_items else {}
+        lc_items = list(catalog.search(collections=["esa-worldcover"], bbox=bbox, limit=1).items())
+        lc_href = lc_items[0].assets["map"].href if lc_items else None
+        dem_stats, lc_stats = await asyncio.gather(
+            asyncio.to_thread(compute_raster_stats, dem_href, geojson),
+            asyncio.to_thread(compute_landcover_percentages, lc_href, geojson)
+        )
+
 
         # Final summary
         summary = {
             "dem": dem_stats,
-            "temperature": lst_stats,
-            "ndvi": ndvi_stats,
+            # "temperature": yearly_lst if yearly_lst else None,
+            "ndvi": yearly_stats if yearly_stats else None,
             "landcover": lc_stats,
         }
         yield f"data: {json.dumps({'summary': summary})}\n\n"

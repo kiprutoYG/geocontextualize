@@ -163,7 +163,7 @@ export default function MapComponent({
         )}
       </MapContainer>
 
-      <div className="absolute top-4 left-4 bg-black/70 text-white px-3 py-2 rounded-lg text-sm backdrop-blur z-[1000]">
+      <div className="absolute top-4 left-4 bg-black/70 text-white px-3 py-2 rounded-lg text-sm sm:text-xs backdrop-blur z-[1000]">
         Search, draw, or upload GeoJSON to select your study area
       </div>
     </div>

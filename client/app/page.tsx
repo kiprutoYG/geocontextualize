@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Feature, FeatureCollection, Geometry } from "geojson";
+import CopySummary from '@/components/Copy';
 
 
 // Dynamic imports to avoid SSR issues with Leaflet
@@ -129,12 +130,18 @@ export default function Home() {
   std: number;
   }
 
-  interface TemperatureStats {
-    annual_mean_C: number;
-  }
+  // interface TemperatureStats {
+  // mean: number;
+  // min: number;
+  // max: number;
+  // std: number;
+  // }
 
   interface NdviStats {
-    annual_mean: number;
+  mean: number;
+  min: number;
+  max: number;
+  std: number;
   }
 
   interface LandcoverStats {
@@ -161,17 +168,17 @@ export default function Home() {
     );
   }
 
-  // 2. Temperature context
-  if (temperature?.annual_mean_C != null) {
-    lines.push(
-      `Climate: warm with a mean annual temperature of ${temperature.annual_mean_C} °C.`
-    );
-  }
+  // // 2. Temperature context
+  // if (temperature?.mean != null) {
+  //   lines.push(
+  //     `Climate: Averaged a mean annual temperature of ${temperature.mean} °C.`
+  //   );
+  // }
 
   // 3. Vegetation NDVI context
-  if (ndvi?.annual_mean != null) {
+  if (ndvi?.mean != null) {
     lines.push(
-      `Vegetation health: (NDVI ≈ ${ndvi.annual_mean.toFixed(2)}, on a scale -1 to +1).`
+      `Vegetation health: (NDVI ≈ ${ndvi.mean.toFixed(2)}, on a scale -1 to +1).`
     );
   }
 
@@ -213,7 +220,7 @@ export default function Home() {
     setResponse('');
 
     try {
-      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'https://geocontextualize.onrender.com';
+      const backendUrl = 'https://geocontextualize.onrender.com'; // Replace with your backend URL
       let geojson;
       // Construct GeoJSON polygon from boundingBox
       if (uploadedGeojson) {
@@ -242,7 +249,7 @@ export default function Home() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ geojson })
+        body: JSON.stringify({ geojson }),
       });
 
       if (!response.ok) throw new Error(`HTTP error! ${response.status}`);
@@ -281,7 +288,7 @@ export default function Home() {
       if(!jsonString) throw new Error("No JSON summary received");
       const data = JSON.parse(jsonString); 
       setResponse(summarizeData(data.summary)); 
-      setSummaryText(summarizeData(data));
+      setSummaryText(summarizeData(data.summary));
       } catch (err) {
         console.error(err);
         setSummaryText("Error: " + (err as Error).message);
@@ -289,25 +296,6 @@ export default function Home() {
         setIsLoading(false);
       }
     };
-
-  // Copy response to clipboard
-  const copyToClipboard = async () => {
-  if (summaryText) {
-    try {
-      await navigator.clipboard.writeText(summaryText);
-    } catch (error) {
-      console.error('Copy error:', error);
-    }
-  }
-  };
-
-  useEffect(() => {
-    return () => {
-      if (searchTimeout.current) {
-        clearTimeout(searchTimeout.current);
-      }
-    };
-  }, []);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-800">
@@ -397,15 +385,15 @@ export default function Home() {
                   <p className="text-sm">Search and select a location to zoom to</p>
                 </div>
                 <div className="flex items-start">
-                  <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">1</div>
+                  <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">2</div>
                   <p className="text-sm">Upload a GeoJSON file to define your study area or if none available, use the drawing tool</p>
                 </div>
                 <div className="flex items-start">
-                  <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">2</div>
+                  <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">3</div>
                   <p className="text-sm">Use the drawing tool to create a bounding box on the map</p>
                 </div>
                 <div className="flex items-start">
-                  <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">3</div>
+                  <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">4</div>
                   <p className="text-sm">Click &quot;Analyze Area&quot; to get geographical context</p>
                 </div>
               </CardContent>
@@ -477,17 +465,7 @@ export default function Home() {
                   <MapPin className="w-5 h-5 mr-2" />
                   Analysis Results
                 </CardTitle>
-                {response && (
-                  <Button
-                    onClick={copyToClipboard}
-                    variant="outline"
-                    size="sm"
-                    className="border-white/30 text-white hover:bg-white/10"
-                  >
-                    <Copy className="w-4 h-4 mr-1" />
-                    Copy
-                  </Button>
-                )}
+                {summaryText && <CopySummary summaryText={summaryText} />}
               </CardHeader>
               <CardContent>
                 <div className="bg-black/20 rounded-lg p-4 min-h-[200px] font-mono text-sm">
