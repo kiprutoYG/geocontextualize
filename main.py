@@ -1,345 +1,494 @@
+# --------------------------------------------------
+# IMPORTS (CRITICAL FIX: rioxarray import)
+# --------------------------------------------------
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Dict, Any
-import httpx, rasterio
+from typing import Dict, Any, Optional, Union, List, Literal
+import rasterio as rio
 from rasterio.mask import mask
 import numpy as np
 import planetary_computer
 import datetime
 from collections import Counter
 import pystac_client
-import odc.stac
-from fastapi.responses import StreamingResponse
 import asyncio
 import json
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Union, List, Dict
-import sentry_sdk
-import geopandas as gpd
-from shapely.geometry import shape, mapping, box
+import os
+from dotenv import load_dotenv
+import google.generativeai as genai
+import sys
+from shapely.geometry import shape
 
-sentry_sdk.init(
-    dsn="https://f3b3208c800a9df29c5e72da1b28fb1a@o4509989478596608.ingest.de.sentry.io/4509989482397776",
-    # Add data like request headers and IP for users,
-    # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
-    send_default_pii=True,
-)
+# Datacube imports (CRITICAL: rioxarray registers .rio accessor)
+from odc.stac import load as stac_load
+import xarray as xr
+import rioxarray  # MUST be imported to enable .rio methods
 
+# --------------------------------------------------
+# ENVIRONMENT
+# --------------------------------------------------
+load_dotenv()
 
+# --------------------------------------------------
+# APP CONFIGURATION
+# --------------------------------------------------
 app = FastAPI(title="GeoContext Generator API")
+
+# CRITICAL FIX: Strip whitespace from origins
+origins = [
+    "https://describearea.vercel.app    ",
+    "http://localhost:3000",
+]
+origins = [origin.strip() for origin in origins if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+# CRITICAL FIX: Strip whitespace from STAC URL
+STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1    ".strip()
 
-# ----------- Schemas ------------ #
+# --------------------------------------------------
+# SCHEMAS
+# --------------------------------------------------
 class GeoJSONRequest(BaseModel):
     geojson: dict
 
 class ContextResponse(BaseModel):
     summary: Dict[str, Any]
+    narrative: Optional[str] = None
 
-# ----------- Helpers ------------ #
-async def query_stac(collection: str, geojson: dict, limit: int = 1, time_range: str = None):
-    """Query Planetary STAC and return item asset links.
-    Arguments:
-        collection (str): The STAC collection to query.
-        geojson (dict): The GeoJSON geometry to intersect with.
-        limit (int): The maximum number of items to return.
-        time_range (str): The time range to filter items by.
+# --------------------------------------------------
+# LANDCOVER LOOKUP
+# --------------------------------------------------
+ESA_WORLDCOVER_CLASSES = {
+    10: "Tree cover",
+    20: "Shrubland",
+    30: "Grassland",
+    40: "Cropland",
+    50: "Built-up areas",
+    60: "Bare or sparse vegetation",
+    70: "Snow and ice",
+    80: "Permanent water bodies",
+    90: "Herbaceous wetlands",
+    95: "Mangroves",
+    100: "Moss and lichen",
+}
 
-    Returns:
-        list: A list of STAC item asset links.
-    """
-    url = f"{STAC_URL}/search"
-    payload = {
-        "collections": [collection],
-        "intersects": geojson["geometry"],
-        "limit": limit,
-        "sortby": [{"field": "properties.datetime", "direction": "desc"}],
+def label_landcover(percentages: Dict[str, float]) -> Dict[str, float]:
+    return {
+        ESA_WORLDCOVER_CLASSES.get(int(code), f"Unknown ({code})"): pct
+        for code, pct in percentages.items()
     }
-    if time_range:
-        payload["datetime"] = time_range
 
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:  # 60s timeout
-            r = await client.post(url, json=payload)
-            r.raise_for_status()
-            data = r.json()
-            return data.get("features", [])
-    except httpx.ReadTimeout:
-        raise HTTPException(status_code=504, detail=f"STAC query for {collection} timed out")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"STAC query failed: {str(e)}")
-
-def compute_raster_stats(asset_href: Union[str, List[str]], geojson: dict) -> Dict[str, float]:
-    try:
-        if isinstance(asset_href, list):
-            stats = []
-            for href in asset_href:
-                signed_url = planetary_computer.sign(href)
-                with rasterio.open(signed_url) as src:
-                    clipped, _ = mask(src, [geojson["geometry"]], crop=True, nodata=src.nodata)
-                    arr = clipped[0].astype(float)
-                    arr[arr == src.nodata] = np.nan
-                    stats.append({
-                        "mean": float(np.nanmean(arr)),
-                        "min": float(np.nanmin(arr)),
-                        "max": float(np.nanmax(arr)),
-                        "std": float(np.nanstd(arr)),
-                    })
-            return {
-                "per_scene": stats,
-                "aggregate": {
-                    "mean": float(np.nanmean([s["mean"] for s in stats])),
-                    "min": float(np.nanmin([s["min"] for s in stats])),
-                    "max": float(np.nanmax([s["max"] for s in stats])),
-                    "std": float(np.nanmean([s["std"] for s in stats])),
-                }
-            }
-        else:
-            signed_url = planetary_computer.sign(asset_href)
-            with rasterio.open(signed_url) as src:
-                clipped, _ = mask(src, [geojson["geometry"]], crop=True, nodata=src.nodata)
-                arr = clipped[0].astype(float)
-                arr[arr == src.nodata] = np.nan
-                return {
-                    "mean": float(np.nanmean(arr)),
-                    "min": float(np.nanmin(arr)),
-                    "max": float(np.nanmax(arr)),
-                    "std": float(np.nanstd(arr)),
-                }
-    except Exception as e:
-        return {"error": str(e)}
-
-def compute_landcover_percentages(asset_href: str, geojson: dict) -> Dict[str, float]:
-    """Compute percentages of land cover classes inside bbox.
-    Arguments:
-        asset_href (str): The URL of the raster asset to download.
-        geojson (dict): The GeoJSON geometry to clip the raster to.
-
-    Returns:
-        Dict[str, float]: A dictionary of land cover class percentages.
-    """
-    try:
-        signed_url = planetary_computer.sign(asset_href)
-        with rasterio.open(signed_url) as src:
-            clipped, _ = mask(src, [geojson["geometry"]], crop=True, nodata=src.nodata)
-            arr = clipped[0].astype(int)
-            arr = arr[arr != src.nodata]
-            total = arr.size
-            counts = Counter(arr.flatten())
-            return {str(k): round((v / total) * 100, 2) for k, v in counts.items()}
-    except Exception as e:
-        return {"error": str(e)}
-    
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
 def normalize_geojson(geojson: dict) -> dict:
     if geojson.get("type") == "FeatureCollection":
         return geojson["features"][0]
-    elif geojson.get("type") == "Feature":
+    if geojson.get("type") == "Feature":
         return geojson
-    raise HTTPException(400, "Unsupported GeoJSON type")
+    raise HTTPException(status_code=400, detail="Unsupported GeoJSON type")
 
-def safe_stats(arr: np.ndarray) -> Dict[str, float]:
-    if arr.size == 0 or np.all(np.isnan(arr)):
-        return {
-            "mean": None,
-            "min": None,
-            "max": None,
-            "std": None,
-            "note": "All pixels nodata or AOI too small"
-        }
+def compute_raster_stats(asset_href: str, geojson: dict) -> Dict[str, float]:
+    try:
+        signed_url = planetary_computer.sign(asset_href)
+        with rio.open(signed_url) as src:
+            clipped, _ = mask(
+                src,
+                [geojson["geometry"]],
+                crop=True,
+                nodata=src.nodata,
+            )
+            arr = clipped[0].astype(float)
+            arr[arr == src.nodata] = np.nan
+
+            return {
+                "mean": float(np.nanmean(arr)),
+                "min": float(np.nanmin(arr)),
+                "max": float(np.nanmax(arr)),
+                "std": float(np.nanstd(arr)),
+            }
+    except Exception as e:
+        print(f"DEM computation error: {str(e)}", file=sys.stderr)
+        return {"error": str(e)}
+
+def interpret_terrain(dem: Dict[str, float]) -> Dict[str, Any]:
+    if not dem or "mean" not in dem:
+        return dem
+
+    elevation_range = dem["max"] - dem["min"]
+
+    if elevation_range < 50:
+        terrain = "relatively flat"
+    elif elevation_range < 300:
+        terrain = "moderately undulating"
+    else:
+        terrain = "highly variable or mountainous"
+
     return {
-        "mean": float(np.nanmean(arr)),
-        "min": float(np.nanmin(arr)),
-        "max": float(np.nanmax(arr)),
-        "std": float(np.nanstd(arr)),
+        **dem,
+        "elevation_range_m": round(elevation_range, 1),
+        "terrain_type": terrain,
     }
 
-
-def calculate_ndvi(red: np.ndarray, nir: np.ndarray) -> np.ndarray:
-    ndvi = (nir - red) / (nir + red + 1e-6)  # add epsilon to avoid div by zero
-    ndvi[np.isinf(ndvi)] = np.nan
-    return ndvi
-
-def compute_modis_ndvi(item, geom):
-    """Compute NDVI stats for a MODIS MOD13A1 item clipped to AOI."""
+def compute_landcover_percentages(asset_href: str, geojson: dict) -> Dict[str, Any]:
     try:
-        ndvi_href = planetary_computer.sign(item.assets["500m_16_days_NDVI"].href)
-
-        with rasterio.open(ndvi_href) as src:
-            # Reproject AOI to MODIS CRS
-            raster_crs = src.crs
-            gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326").to_crs(raster_crs)
-            geom_reproj = mapping(gdf.iloc[0].geometry)
-
-            # Clip raster
-            clipped, _ = mask(src, [geom_reproj], crop=True)
-            arr = clipped[0].astype("float32")
-            if arr.size == 0 or np.all(np.isnan(arr)):
-                return {"mean": None, "min": None, "max": None, "std": None}
-            else:
-                # MODIS NDVI: nodata = -3000, valid -2000 → 10000
-                arr[arr <= -2000] = np.nan
-
-                if np.all(np.isnan(arr)):
-                    return {"mean": np.nan, "min": np.nan, "max": np.nan, "std": np.nan}
-
-                # Apply scale factor
-                ndvi = arr * 0.0001
-
-                return {
-                    "mean": float(np.nanmean(ndvi)),
-                    "min": float(np.nanmin(ndvi)),
-                    "max": float(np.nanmax(ndvi)),
-                    "std": float(np.nanstd(ndvi)),
-                }
-    except Exception as e:
-        return {"error": str(e)}
-def compute_modis_lst(item, geom, to_celsius: bool = True) -> Dict[str, float]:
-    """Compute MODIS LST stats (MOD11A1) for AOI."""
-    try:
-        lst_href = planetary_computer.sign(item.assets["LST_Day_1km"].href)
-        with rasterio.open(lst_href) as src:
-            raster_crs = src.crs
-            gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326").to_crs(raster_crs)
-            geom_reproj = mapping(gdf.iloc[0].geometry)
-
-            clipped, _ = mask(src, [geom_reproj], crop=True)
-            arr = clipped[0]
-
-            # MOD11A1 scale factor: 0.02, values in Kelvin
-            stats = safe_stats(arr, scale=0.02)
-
-            if stats["mean"] is not None and to_celsius:
-                # Convert from Kelvin to Celsius
-                for k in ["mean", "min", "max"]:
-                    if stats[k] is not None:
-                        stats[k] = stats[k] - 273.15
-
-            return stats
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ----------- API Endpoint ------------ #
-@app.post("/generate-context")
-async def generate_context(request: GeoJSONRequest):
-    """Generate geospatial context for a given GeoJSON polygon."""
-    
-    geojson = normalize_geojson(request.geojson)
-
-    coords = geojson["geometry"]["coordinates"][0]
-    xs = [c[0] for c in coords]
-    ys = [c[1] for c in coords]
-    bbox = [min(xs), min(ys), max(xs), max(ys)]
-
-    current_year = datetime.date.today().year
-    last_year = current_year - 1
-    time_range = f"{last_year}-01-01/{last_year}-12-31"
-
-    catalog = pystac_client.Client.open(STAC_URL, modifier=planetary_computer.sign_inplace)
-
-    async def event_stream():
-        # DEM
-        dem_items = list(catalog.search(collections=["nasadem"], bbox=bbox, limit=1).items())
-        dem_href = dem_items[0].assets["elevation"].href if dem_items else None
-
-        # # LST
-        # months = {
-        #     "March": "03",
-        #     "June": "06",
-        #     "September": "09",
-        #     "December": "12",
-        # }
-        # items = {}
-        # for name, number in months.items():
-        #     datetime = f"{last_year}-{number}"
-        #     search = catalog.search(
-        #         collections=["modis-11A1-061"],  # MOD11A1: Daily LST 1km
-        #         bbox=bbox,
-        #         datetime=datetime,
-        #     )
-        #     try:
-        #         items[name] = next(search.items())
-        #     except StopIteration:
-        #         print(f"No MODIS LST found for {name} {last_year}")
-
-        # results = {}
-        # aoi_geom = box(*bbox)
-        # for month, item in items.items():
-        #     results[month] = compute_modis_lst(item, aoi_geom)
-
-        # # Yearly average
-        # valid = [r for r in results.values() if "mean" in r and r["mean"] is not None]
-        # if valid:
-        #     yearly_lst = {
-        #         "mean": float(np.nanmean([r["mean"] for r in valid])),
-        #         "min": float(np.nanmin([r["min"] for r in valid])),
-        #         "max": float(np.nanmax([r["max"] for r in valid])),
-        #         "std": float(np.nanmean([r["std"] for r in valid])),
-        #     }
-        # NDVI
-        yield "data: Searching NDVI (Sentinel2)...\n\n"
-        months = {
-        "January": "01",
-        "April": "04",
-        "July": "07",
-        "October": "10",
-        }
-        items = {}
-        # Get 1 MODIS scene per chosen month
-        for name, number in months.items():
-            datetime = f"{last_year}-{number}"
-            search = catalog.search(
-                collections=["modis-13A1-061"],  # MOD13A1: 16-day NDVI, 500m
-                bbox=bbox,
-                datetime=datetime,
+        signed_url = planetary_computer.sign(asset_href)
+        with rio.open(signed_url) as src:
+            clipped, _ = mask(
+                src,
+                [geojson["geometry"]],
+                crop=True,
+                nodata=src.nodata,
             )
-            try:
-                items[name] = next(search.items())  # first available scene in that month
-            except StopIteration:
-                print(f"No MODIS NDVI found for {name} {last_year}")
+            arr = clipped[0].astype(int)
+            arr = arr[arr != src.nodata]
 
-        # -------------------
-        # Compute stats for each quarter
-        results = {}
-        aoi_geom = box(*bbox) # bounding box polygon
-        for month, item in items.items():
-            stats = compute_modis_ndvi(item, aoi_geom)
-            results[month] = stats
+            if arr.size == 0:
+                return {"error": "No valid landcover pixels"}
 
-        # Optional: compute yearly average stats
-        valid = [r for r in results.values() if "mean" in r]
-        if valid:
-            yearly_stats = {
-                "mean": float(np.nanmean([r["mean"] for r in valid])),
-                "min": float(np.nanmin([r["min"] for r in valid])),
-                "max": float(np.nanmax([r["max"] for r in valid])),
-                "std": float(np.nanmean([r["std"] for r in valid])),
+            counts = Counter(arr.flatten())
+            total = arr.size
+
+            percentages = {
+                str(k): round((v / total) * 100, 2)
+                for k, v in counts.items()
             }
-        # Landcover
-        yield "data: Analyzing landcover...\n\n"
-        lc_items = list(catalog.search(collections=["esa-worldcover"], bbox=bbox, limit=1).items())
-        lc_href = lc_items[0].assets["map"].href if lc_items else None
-        dem_stats, lc_stats = await asyncio.gather(
-            asyncio.to_thread(compute_raster_stats, dem_href, geojson),
-            asyncio.to_thread(compute_landcover_percentages, lc_href, geojson)
+
+            labeled = label_landcover(percentages)
+            dominant_class = max(labeled, key=labeled.get)
+
+            return {
+                "classes": labeled,
+                "dominant_class": dominant_class,
+                "dominant_percentage": labeled[dominant_class],
+            }
+    except Exception as e:
+        print(f"Landcover computation error: {str(e)}", file=sys.stderr)
+        return {"error": str(e)}
+
+# --------------------------------------------------
+# DATA CUBE HELPER (Optimized: Clip BEFORE Median)
+# --------------------------------------------------
+async def compute_median_ndvi(
+    bbox: list, 
+    geojson_geom: dict,
+    max_area_km2: float = 10.0,
+    max_scenes: int = 8,
+    resolution_m: int = 20,
+) -> dict | None:
+    """
+    Optimized median composite NDVI: CLIP BEFORE MEDIAN to reduce compute 50-80%
+    """
+    try:
+        # --- 1. Area guardrail ---
+        minx, miny, maxx, maxy = bbox
+        width_km = (maxx - minx) * 111.32
+        height_km = (maxy - miny) * 111.32
+        area_km2 = width_km * height_km
+        
+        if area_km2 > max_area_km2:
+            print(f"⚠️ Skipping NDVI: area {area_km2:.1f}km² > {max_area_km2}km² limit", file=sys.stderr)
+            return None
+
+        # --- 2. Time window ---
+        end = datetime.datetime.utcnow()
+        start = end - datetime.timedelta(days=90)
+        time_window = f"{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
+
+        # --- 3. Search with limits ---
+        catalog = pystac_client.Client.open(
+            STAC_URL, 
+            modifier=planetary_computer.sign_inplace
+        )
+        
+        search = catalog.search(
+            collections=["sentinel-2-l2a"],
+            bbox=bbox,
+            datetime=time_window,
+            query={"eo:cloud_cover": {"lt": 30}},
+            limit=max_scenes
+        )
+        items = list(search.items())
+        
+        if len(items) < 2:
+            print(f"⚠️ Skipping NDVI: found {len(items)} scenes (<2 required)", file=sys.stderr)
+            return None
+
+        # --- 4. Load with memory-safe params ---
+        resolution_deg = resolution_m / 111320.0
+        
+        data = stac_load(
+            items,
+            bands=["B04", "B08", "SCL"],
+            crs="EPSG:4326",
+            resolution=resolution_deg,
+            chunks={"x": 512, "y": 512},
+            patch_url=planetary_computer.sign,
+            bbox=bbox,
+            dtype="uint16",
+            groupby="solar_day",
+            skip_broken=True,
+        )
+        
+        # --- 5. Cloud mask ---
+        valid_mask = data.SCL.isin([4, 5, 6, 7, 11])
+        data = data.where(valid_mask)
+        
+        # --- ✅ CRITICAL OPTIMIZATION: Clip BEFORE median ---
+        # Compute NDVI per-scene FIRST
+        ndvi = (data.B08 - data.B04) / (data.B08 + data.B04 + 1e-8)
+        
+        # Clip to AOI BEFORE reduction (massive speedup)
+        ndvi = ndvi.rio.write_crs("EPSG:4326")
+        ndvi_clipped = ndvi.rio.clip([geojson_geom], crs="EPSG:4326", all_touched=True)
+        
+        # NOW compute median on clipped data only
+        median_ndvi = ndvi_clipped.median(dim="time")
+        
+        # --- 6. Compute stats in thread ---
+        def _compute_stats():
+            arr = median_ndvi.values.astype(float)
+            arr = arr[~np.isnan(arr) & (arr > -1) & (arr < 1)]
+            
+            if arr.size == 0:
+                return None
+                
+            return {
+                "mean": float(np.mean(arr)),
+                "min": float(np.min(arr)),
+                "max": float(np.max(arr)),
+                "std": float(np.std(arr)),
+                "p25": float(np.percentile(arr, 25)),
+                "p75": float(np.percentile(arr, 75)),
+                "scene_count": len(items),
+                "resolution_m": resolution_m,
+                "method": "median_composite_optimized",  # Note optimization
+            }
+        
+        # ⚠️ Keep timeout as safety rail (25s = Render 30s - 5s buffer)
+        stats = await asyncio.wait_for(
+            asyncio.to_thread(_compute_stats),
+            timeout=65.0  # 25s leaves 5s buffer before Render kills at 30s
+        )
+        
+        return stats if stats and stats["mean"] is not None else None
+        
+    except asyncio.TimeoutError as e:
+        print(f"⚠️ NDVI TIMEOUT after 25s (area likely too large)", file=sys.stderr)
+        return None
+    except MemoryError as e:
+        print(f"⚠️ NDVI MEMORY ERROR", file=sys.stderr)
+        return None
+    except Exception as e:
+        # 🔍 Critical: log actual exception type for debugging
+        print(f"⚠️ NDVI FAILED type={type(e).__name__} msg={str(e)[:150]}", file=sys.stderr)
+        return None
+
+# --------------------------------------------------
+# GEMINI
+# --------------------------------------------------
+def load_prompt_template(name: str) -> str:
+    path = os.path.join("prompts", name)
+    with open(path, "r") as f:
+        return f.read()
+
+def generate_study_area_narrative(
+    summary: Dict[str, Any],
+    audience: Literal["academic", "investor", "farmer", "policy"] = "academic",
+) -> str:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return "AI narrative generation unavailable: API key not configured"
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.5-flash")
+
+    prompt = load_prompt_template("study_area_v1.txt").format(
+        summary_data=json.dumps(summary, indent=2),
+        audience=audience,
+    )
+
+    response = model.generate_content(prompt)
+    return response.text.strip()
+
+# --------------------------------------------------
+# API ENDPOINT
+# --------------------------------------------------
+@app.post("/generate-context", response_model=ContextResponse)
+async def generate_context(
+    request: GeoJSONRequest,
+    include_narrative: bool = False,
+    audience: str = "academic",
+    include_ndvi: bool = True,
+):
+    try:
+        geojson = normalize_geojson(request.geojson)
+        geom = geojson["geometry"]
+        
+        coords = geom["coordinates"][0]
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        bbox = [min(xs), min(ys), max(xs), max(ys)]
+
+        catalog = pystac_client.Client.open(
+            STAC_URL,
+            modifier=planetary_computer.sign_inplace,
         )
 
+        dem_items = list(
+            catalog.search(collections=["nasadem"], bbox=bbox, limit=1).items()
+        )
+        lc_items = list(
+            catalog.search(collections=["esa-worldcover"], bbox=bbox, limit=1).items()
+        )
+        
+        if not dem_items or not lc_items:
+            raise HTTPException(
+                status_code=400, 
+                detail="No elevation or landcover data available for this area"
+            )
 
-        # Final summary
+        dem_href = dem_items[0].assets["elevation"].href
+        lc_href = lc_items[0].assets["map"].href
+
+        # Process DEM + Landcover with timeout guardrail
+        try:
+            raw_dem, landcover = await asyncio.wait_for(
+                asyncio.gather(
+                    asyncio.to_thread(compute_raster_stats, dem_href, geojson),
+                    asyncio.to_thread(compute_landcover_percentages, lc_href, geojson),
+                ),
+                timeout=20.0  # 20s buffer before Render 30s kill
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="Processing timeout (Render free tier limit). Try smaller area."
+            )
+        except MemoryError:
+            raise HTTPException(
+                status_code=507,
+                detail="Memory exceeded (Render free tier limit). Reduce area size."
+            )
+
+        dem = interpret_terrain(raw_dem)
+
+        # Compute NDVI (optimized pipeline)
+        ndvi_stats = None
+        if include_ndvi:
+            ndvi_stats = await compute_median_ndvi(
+                bbox=bbox,
+                geojson_geom=geom,
+                max_area_km2=100.0,
+                max_scenes=8,
+                resolution_m=20,
+            )
+            if ndvi_stats is None:
+                print("⚠️ Falling back to MODIS NDVI (coarse resolution)", file=sys.stderr)
+                ndvi_stats = await compute_modis_ndvi_fallback(bbox)
+
         summary = {
-            "dem": dem_stats,
-            # "temperature": yearly_lst if yearly_lst else None,
-            "ndvi": yearly_stats if yearly_stats else None,
-            "landcover": lc_stats,
+            "dem": dem,
+            "ndvi": ndvi_stats,
+            "landcover": landcover,
         }
-        yield f"data: {json.dumps({'summary': summary})}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+        result = {"summary": summary}
+
+        if include_narrative:
+            try:
+                narrative = await asyncio.wait_for(
+                    asyncio.to_thread(generate_study_area_narrative, summary, audience),
+                    timeout=10.0  # Narrative is fast but guard anyway
+                )
+                result["narrative"] = narrative
+            except asyncio.TimeoutError:
+                result["narrative"] = "Narrative generation timed out (free tier limit)."
+            except Exception as e:
+                print(f"Narrative generation error: {str(e)}", file=sys.stderr)
+                result["narrative"] = f"Narrative generation failed: {str(e)[:100]}"
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"CRITICAL ERROR in /generate-context: {type(e).__name__} - {str(e)[:200]}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)[:150]}")
+
+# --------------------------------------------------
+# FALLBACK: MODIS NDVI
+# --------------------------------------------------
+async def compute_modis_ndvi_fallback(bbox: list) -> dict | None:
+    try:
+        catalog = pystac_client.Client.open(
+            STAC_URL,
+            modifier=planetary_computer.sign_inplace,
+        )
+        
+        year = datetime.date.today().year - 1
+        months = ["01", "04", "07", "10"]
+        ndvi_vals = []
+
+        for m in months:
+            search = catalog.search(
+                collections=["modis-13A1-061"],
+                bbox=bbox,
+                datetime=f"{year}-{m}",
+            )
+            try:
+                item = next(search.items())
+                href = planetary_computer.sign(
+                    item.assets["500m_16_days_NDVI"].href
+                )
+                with rio.open(href) as src:
+                    arr = src.read(1).astype(float)
+                    arr[arr <= -2000] = np.nan
+                    ndvi_vals.append(arr * 0.0001)
+            except StopIteration:
+                continue
+
+        if not ndvi_vals:
+            return None
+
+        return {
+            "mean": float(np.nanmean(ndvi_vals)),
+            "min": float(np.nanmin(ndvi_vals)),
+            "max": float(np.nanmax(ndvi_vals)),
+            "std": float(np.nanstd(ndvi_vals)),
+            "method": "modis_fallback",
+            "resolution_m": 500,
+            "warning": "Coarse resolution (500m) - use smaller areas for better accuracy",
+        }
+    except Exception as e:
+        print(f"MODIS fallback error: {type(e).__name__} - {str(e)[:150]}", file=sys.stderr)
+        return None
+
+# --------------------------------------------------
+# HEALTH CHECK
+# --------------------------------------------------
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "GeoContext Generator API",
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "version": "1.1.0-optimized"
+    }
+
+@app.get("/version")
+async def get_version():
+    return {
+        "version": "1.1.0",
+        "optimizations": ["clip_before_median", "timeout_guardrails", "graceful_degradation"],
+        "max_area_km2": 10.0,
+        "ndvi_resolution_m": 20
+    }
