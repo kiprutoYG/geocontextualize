@@ -407,7 +407,7 @@ async def generate_context(
             try:
                 narrative = await asyncio.wait_for(
                     asyncio.to_thread(generate_study_area_narrative, summary, audience),
-                    timeout=10.0  # Narrative is fast but guard anyway
+                    timeout=60.0  # Narrative is fast but guard anyway
                 )
                 result["narrative"] = narrative
             except asyncio.TimeoutError:
