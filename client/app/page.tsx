@@ -2,13 +2,18 @@
 
 import { useState, useRef } from 'react';
 import dynamic from 'next/dynamic';
-import { Search, MapPin, Loader2, Globe, Satellite } from 'lucide-react';
+import { Search, MapPin, Loader2, Globe, Satellite, Download } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
+import { Label } from '@/components/ui/label';
+import { Badge } from '@/components/ui/badge';
 import { Feature, FeatureCollection, Geometry } from "geojson";
 import CopySummary from '@/components/Copy';
+import { useToast } from '@/hooks/use-toast';
 
 
 // Dynamic imports to avoid SSR issues with Leaflet
@@ -40,19 +45,22 @@ interface BoundingBox {
 }
 
 export default function Home() {
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
-  const [summaryText, setSummaryText] = useState<string>('');
-  const [showResults, setShowResults] = useState(false);
-  const [selectedLocation, setSelectedLocation] = useState<{lat: number, lng: number} | null>(null);
-  const [boundingBox, setBoundingBox] = useState<BoundingBox | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-  const [response, setResponse] = useState<string>('');
-  const [isSearching, setIsSearching] = useState(false);
-  const [includeNarrative, setIncludeNarrative] = useState<boolean>(true);
-  const [includeNdvi, setIncludeNdvi] = useState<boolean>(true);
-  const searchTimeout = useRef<NodeJS.Timeout | null>(null);
-  const [uploadedGeojson, setUploadedGeojson] = useState<Feature<Geometry> | FeatureCollection<Geometry> | null>(null);
+   const { toast } = useToast();
+   const [searchQuery, setSearchQuery] = useState('');
+   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+   const [summaryText, setSummaryText] = useState<string>('');
+   const [showResults, setShowResults] = useState(false);
+   const [selectedLocation, setSelectedLocation] = useState<{lat: number, lng: number} | null>(null);
+   const [boundingBox, setBoundingBox] = useState<BoundingBox | null>(null);
+   const [isLoading, setIsLoading] = useState(false);
+   const [response, setResponse] = useState<string>('');
+   const [isSearching, setIsSearching] = useState(false);
+   const [audience, setAudience] = useState<string>('academic');
+   const [summaryType, setSummaryType] = useState<'raw' | 'narrative'>('narrative');
+   const [selectedDatasets, setSelectedDatasets] = useState<string[]>(['dem', 'landcover', 'ndvi']);
+   const [drawnFeatures, setDrawnFeatures] = useState<FeatureCollection<Geometry> | null>(null);
+   const searchTimeout = useRef<NodeJS.Timeout | null>(null);
+   const [uploadedGeojson, setUploadedGeojson] = useState<Feature<Geometry> | FeatureCollection<Geometry> | null>(null);
 
 
   // Search for places using Nominatim
@@ -117,9 +125,17 @@ export default function Home() {
         const parsed = JSON.parse(event.target?.result as string);
         setUploadedGeojson(parsed);
         // boundingBox auto-updated in MapComponent
+        toast({
+          title: "Success",
+          description: "GeoJSON file uploaded successfully.",
+        });
       } catch (err) {
         console.error("Invalid GeoJSON file", err);
-        alert("Invalid GeoJSON file.");
+        toast({
+          title: "Error",
+          description: "Invalid GeoJSON file. Please check the file format.",
+          variant: "destructive",
+        });
       }
     };
     reader.readAsText(file);
@@ -285,8 +301,12 @@ export default function Home() {
         };
       }
       console.log("Sending to backend:", JSON.stringify({ geojson }, null, 2));
-      // Add include_narrative and include_ndvi parameters to the URL based on checkbox states
-      const response = await fetch(`${backendUrl}/generate-context?include_narrative=${includeNarrative}&audience=academic&include_ndvi=${includeNdvi}`, {
+      // Add include_narrative and include_ndvi parameters to the URL based on selections
+      const includeNarrativeParam = summaryType === 'narrative';
+      const datasetsParam = selectedDatasets.join(',');
+      // Determine if NDVI should be included based on dataset selection
+      const includeNdviParam = selectedDatasets.includes('ndvi');
+      const response = await fetch(`${backendUrl}/generate-context?include_narrative=${includeNarrativeParam}&audience=${audience}&include_ndvi=${includeNdviParam}&datasets=${datasetsParam}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -319,8 +339,8 @@ export default function Home() {
             </h1>
           </div>
           <p className="text-slate-300 text-lg max-w-2xl mx-auto">
-            Discover geographical context and insights by selecting any area on Earth. 
-            Search, draw, and analyze with advanced geospatial intelligence.
+            Discover geographical context and insights by selecting any area on Earth.
+            Search, draw, and analyze with advanced geospatial tools.
           </p>
         </div>
 
@@ -433,30 +453,62 @@ export default function Home() {
                 <CardTitle className="text-white">Options</CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="space-y-3">
-                  <div className="flex items-center space-x-2">
-                    <input
-                      type="checkbox"
-                      id="includeNarrative"
-                      checked={includeNarrative}
-                      onChange={(e) => setIncludeNarrative(e.target.checked)}
-                      className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
-                    />
-                    <label htmlFor="includeNarrative" className="text-sm text-slate-300">
-                      Include AI-generated narrative description
-                    </label>
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <Label className="text-sm font-medium text-slate-300">Audience Type</Label>
+                    <Select value={audience} onValueChange={setAudience}>
+                      <SelectTrigger className="w-full bg-white/20 border-white/30 text-white">
+                        <SelectValue placeholder="Select audience" />
+                      </SelectTrigger>
+                      <SelectContent className="bg-white text-gray-900">
+                        <SelectItem value="academic">Academic Researcher</SelectItem>
+                        <SelectItem value="investor">Investor</SelectItem>
+                        <SelectItem value="farmer">Farmer</SelectItem>
+                        <SelectItem value="policy">Policy Maker</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
-                  <div className="flex items-center space-x-2">
-                    <input
-                      type="checkbox"
-                      id="includeNdvi"
-                      checked={includeNdvi}
-                      onChange={(e) => setIncludeNdvi(e.target.checked)}
-                      className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
-                    />
-                    <label htmlFor="includeNdvi" className="text-sm text-slate-300">
-                      Include NDVI analysis (recommended for areas under 10 km²)
-                    </label>
+                  <div className="space-y-2">
+                    <Label className="text-sm font-medium text-slate-300">Summary Type</Label>
+                    <RadioGroup
+                      value={summaryType}
+                      onValueChange={(value: 'raw' | 'narrative') => setSummaryType(value)}
+                      className="flex space-x-4"
+                    >
+                      <div className="flex items-center space-x-2">
+                        <RadioGroupItem value="raw" id="raw" />
+                        <Label htmlFor="raw" className="text-sm text-slate-300">Raw Data</Label>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <RadioGroupItem value="narrative" id="narrative" />
+                        <Label htmlFor="narrative" className="text-sm text-slate-300">Narrative</Label>
+                      </div>
+                    </RadioGroup>
+                  </div>
+                  <div className="space-y-2">
+                    <Label className="text-sm font-medium text-slate-300">Datasets to Analyze</Label>
+                    <div className="flex flex-wrap gap-2">
+                      {['dem', 'landcover', 'ndvi'].map((dataset) => (
+                        <div key={dataset} className="flex items-center space-x-1">
+                          <input
+                            type="checkbox"
+                            id={`dataset-${dataset}`}
+                            checked={selectedDatasets.includes(dataset)}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setSelectedDatasets([...selectedDatasets, dataset]);
+                              } else {
+                                setSelectedDatasets(selectedDatasets.filter(d => d !== dataset));
+                              }
+                            }}
+                            className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
+                          />
+                          <label htmlFor={`dataset-${dataset}`} className="text-sm text-slate-300 capitalize">
+                            {dataset}
+                          </label>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                   <p className="text-xs text-slate-400 mt-2">
                     Enhances statistical data with contextual descriptions
@@ -497,11 +549,30 @@ export default function Home() {
               </CardHeader>
               <CardContent>
                 <div className="rounded-lg overflow-hidden">
-                  <MapComponent
-                    selectedLocation={selectedLocation}
-                    onBoundingBoxCreated={handleBoundingBoxCreated}
-                    uploadedGeoJSON={uploadedGeojson}
-                  />
+                  <div className="relative">
+                    <MapComponent
+                      selectedLocation={selectedLocation}
+                      onBoundingBoxCreated={handleBoundingBoxCreated}
+                      uploadedGeoJSON={uploadedGeojson}
+                      onSaveFeatures={setDrawnFeatures}
+                    />
+                    {drawnFeatures && drawnFeatures.features.length > 0 && (
+                      <button
+                        onClick={() => {
+                          const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(drawnFeatures, null, 2));
+                          const downloadAnchorNode = document.createElement('a');
+                          downloadAnchorNode.setAttribute("href", dataStr);
+                          downloadAnchorNode.setAttribute("download", "drawn_features.geojson");
+                          document.body.appendChild(downloadAnchorNode); // required for firefox
+                          downloadAnchorNode.click();
+                          downloadAnchorNode.remove();
+                        }}
+                        className="absolute bottom-4 right-4 bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-md text-sm z-[1000]"
+                      >
+                        Download GeoJSON
+                      </button>
+                    )}
+                  </div>
                 </div>
               </CardContent>
             </Card>
@@ -516,7 +587,7 @@ export default function Home() {
                 {summaryText && <CopySummary summaryText={summaryText} />}
               </CardHeader>
               <CardContent>
-                <div className="bg-black/20 rounded-lg p-4 min-h-[200px] font-mono text-sm">
+                <div className="bg-black/20 rounded-lg p-4 min-h-[200px]">
                   {isLoading ? (
                     <div className="flex items-center justify-center h-48">
                       <div className="text-center">
@@ -531,7 +602,11 @@ export default function Home() {
                       </div>
                     </div>
                   ) : response ? (
-                    <pre className="text-slate-200 whitespace-pre-wrap break-words">{response}</pre>
+                    <div className="text-slate-200 whitespace-pre-wrap break-words text-base leading-relaxed">
+                      {response.split('\n').map((paragraph, index) => (
+                        <p key={index} className="mb-3 last:mb-0">{paragraph}</p>
+                      ))}
+                    </div>
                   ) : (
                     <div className="flex items-center justify-center h-48 text-slate-400">
                       <div className="text-center">

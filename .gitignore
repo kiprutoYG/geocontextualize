@@ -1,6 +1,6 @@
 .env
-__pycache__
-.vscode
+__pycache__/
 .agents
-.qwen
 .kilocode
+.qwen
+.vscode
