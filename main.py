@@ -37,7 +37,7 @@ app = FastAPI(title="GeoContext Generator API")
 
 # CRITICAL FIX: Strip whitespace from origins
 origins = [
-    "https://describearea.vercel.app    ",
+    "https://geocontextualize.vercel.app/    ",
     "http://localhost:3000",
 ]
 origins = [origin.strip() for origin in origins if origin.strip()]
