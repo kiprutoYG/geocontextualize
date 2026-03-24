@@ -4,3 +4,5 @@ __pycache__/
 .kilocode
 .qwen
 .vscode
+client/.next
+client/node_modules

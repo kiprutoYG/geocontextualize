@@ -339,8 +339,8 @@ export default function Home() {
             </h1>
           </div>
           <p className="text-slate-300 text-lg max-w-2xl mx-auto">
-            Discover geographical context and insights by selecting any area on Earth.
-            Search, draw, and analyze with advanced geospatial tools.
+            Instantly generate location insights for reports and analysis.
+            Select any area and get elevation, vegetation, and land cover summaries in seconds.
           </p>
         </div>
 
@@ -576,7 +576,32 @@ export default function Home() {
                 </div>
               </CardContent>
             </Card>
-
+            {selectedDatasets.length > 0 && (
+              <div className="mb-4">
+                <div className="bg-blue-900/30 border border-blue-500/30 rounded-lg p-4">
+                  <h3 className="text-sm font-semibold text-blue-300 mb-2">
+                    Data Sources & Methods
+                  </h3>
+                  <ul className="text-xs text-slate-300 space-y-1 leading-relaxed">
+                    {selectedDatasets.includes('landcover') && (
+                      <li>
+                        <strong>Land Cover:</strong> ESA WorldCover (10m resolution, global classification)
+                      </li>
+                    )}
+                    {selectedDatasets.includes('dem') && (
+                      <li>
+                        <strong>Elevation (DEM):</strong> NASADEM (approx. 30m resolution)
+                      </li>
+                    )}
+                    {selectedDatasets.includes('ndvi') && (
+                      <li>
+                        <strong>Vegetation (NDVI):</strong> Sentinel-2 imagery median composite of the most recent 8 cloud-filtered scenes (reduces noise from clouds and outliers)
+                      </li>
+                    )}
+                  </ul>
+                </div>
+              </div>
+            )}
             {/* Results */}
             <Card className="bg-white/10 backdrop-blur border-white/20">
               <CardHeader className="flex flex-row items-center justify-between">
