@@ -5,6 +5,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
 
 # ----------------------
 # Virtual environments
@@ -12,6 +14,7 @@ __pycache__/
 venv/
 .env
 *.env
+.cache/
 
 # ----------------------
 # Frontend (ignore client folder)
@@ -24,6 +27,11 @@ client/
 Dockerfile
 docker-compose.yml
 *.log
+.git/
+.github/
+.agents/
+.codex/
+benchmark_*.json
 
 # ----------------------
 # OS / editor files

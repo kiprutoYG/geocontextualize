@@ -29,9 +29,13 @@ interface BoundingBox {
 
 interface MapComponentProps {
   selectedLocation: { lat: number; lng: number } | null;
-  onBoundingBoxCreated: (bbox: BoundingBox) => void;
+  onBoundingBoxCreated: (bbox: BoundingBox | null) => void;
   uploadedGeoJSON?: GeoJSON.GeoJsonObject | null;
   onSaveFeatures?: (features: GeoJSON.FeatureCollection) => void;
+}
+
+function isDrawCreatedEvent(event: L.LeafletEvent): event is L.DrawEvents.Created {
+  return "layer" in event && "layerType" in event;
 }
 
 function MapController({
@@ -53,9 +57,9 @@ function MapController({
     };
 
     drawnItemsRef.current.eachLayer((layer: L.Layer) => {
-      if (layer instanceof L.Polygon || layer instanceof L.Polyline || layer instanceof L.Circle || layer instanceof L.Rectangle) {
+      if (layer instanceof L.Polygon || layer instanceof L.Rectangle) {
         // Convert layer to GeoJSON using leaflet's built-in method
-        const geoJsonFeature = (layer as any).toGeoJSON();
+        const geoJsonFeature = layer.toGeoJSON();
         if (geoJsonFeature && geoJsonFeature.type === 'Feature') {
           geojsonData.features.push(geoJsonFeature);
         }
@@ -66,10 +70,12 @@ function MapController({
   }, []);
 
   // Memoize event handlers to prevent recreation on every render
-  const handleCreated = useCallback((e: any) => {
+  const handleCreated = useCallback((e: L.LeafletEvent) => {
     if (!drawnItemsRef.current) return;
+    if (!isDrawCreatedEvent(e)) return;
     
     const { layer } = e;
+    if (!(layer instanceof L.Polygon || layer instanceof L.Rectangle)) return;
     drawnItemsRef.current.clearLayers();
     drawnItemsRef.current.addLayer(layer);
 
@@ -91,7 +97,7 @@ function MapController({
   }, [onBoundingBoxCreated, onSaveFeatures, convertToGeoJSON]);
 
   const handleDeleted = useCallback(() => {
-    onBoundingBoxCreated({ north: 0, south: 0, east: 0, west: 0 });
+    onBoundingBoxCreated(null);
     
     if (onSaveFeatures) {
       const geojsonData = convertToGeoJSON();
@@ -101,7 +107,7 @@ function MapController({
     }
   }, [onBoundingBoxCreated, onSaveFeatures, convertToGeoJSON]);
 
-  const handleEdited = useCallback((e: any) => {
+  const handleEdited = useCallback(() => {
     if (onSaveFeatures) {
       const geojsonData = convertToGeoJSON();
       if (geojsonData) {
@@ -139,12 +145,9 @@ function MapController({
       const drawControl = new L.Control.Draw({
         position: "topright",
         draw: {
-          polyline: {
-            shapeOptions: {
-              color: "#3b82f6",
-              weight: 2,
-            },
-          },
+          // Lines and circles serialize to unsupported GeoJSON geometries for
+          // area analysis, so only offer geometry types the API can analyze.
+          polyline: false,
           polygon: {
             shapeOptions: {
               color: "#3b82f6",
@@ -152,13 +155,7 @@ function MapController({
               fillOpacity: 0.1,
             },
           },
-          circle: {
-            shapeOptions: {
-              color: "#3b82f6",
-              weight: 2,
-              fillOpacity: 0.1,
-            },
-          },
+          circle: false,
           marker: false,
           circlemarker: false,
           rectangle: {
@@ -242,7 +239,7 @@ export default function MapComponent({
       </MapContainer>
 
       <div className="absolute top-4 left-4 bg-black/70 text-white px-3 py-2 rounded-lg text-sm sm:text-xs backdrop-blur z-[1000]">
-        Draw shape to select your area
+        Draw a polygon or rectangle to select your area
       </div>
     </div>
   );

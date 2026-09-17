@@ -1,123 +1,67 @@
 # GeoContextualize
 
-A geospatial analysis API that generates contextual information about any location on Earth using satellite imagery and geospatial datasets.
+GeoContextualize turns a polygonal study area into a concise geospatial
+context: terrain from NASADEM, land cover from ESA WorldCover, and a bounded
+Sentinel-2 NDVI composite from Microsoft Planetary Computer. Optional modules
+add soil, population, climate, hydrology, country context, and a Gemini
+narrative.
 
-## Features
+## Reliable-by-default analysis
 
-- Elevation analysis using NASADEM
-- Landcover classification using ESA WorldCover
-- NDVI (Normalized Difference Vegetation Index) analysis using Sentinel-2 data
-- AI-powered narrative descriptions using Google Gemini
-- Support for custom GeoJSON areas
-- Render and Railway deployment ready
+- Accepts GeoJSON `Polygon`, `MultiPolygon`, `Feature`, and `FeatureCollection`.
+  FeatureCollection polygons are combined rather than silently discarding all
+  but the first feature.
+- Rejects malformed, oversized, or overly complex inputs before calling an
+  external service.
+- Caps synchronous bounding boxes at 100 km² by default and NDVI at 10 km².
+- Searches at most four recent cloud-filtered Sentinel-2 scenes and clips data
+  to the submitted geometry before calculating the median.
+- Uses Planetary Computer only for NDVI. There is no EOPF or unsafe full-raster
+  MODIS fallback.
+- Limits concurrent analyses so one request cannot exhaust the server or shared
+  public data services.
 
-## Deployment
+Large study areas are not silently downgraded: NDVI returns a clear `skipped`
+status. Supporting large asynchronous analysis needs a durable job queue and
+worker, which is deliberately outside this synchronous service.
 
-The API is deployed on both Render and Railway:
+## Local setup
 
-- **Railway**: https://describeyourarea-production.up.railway.app
-- **Render**: (URL to be added)
+```bash
+cp .env.example .env
+# Add GEMINI_API_KEY if narrative generation is needed.
+python -m pip install -r requirements.txt
+uvicorn main:app --reload
+```
 
-## Backend (API)
+In a second terminal:
 
-Built with FastAPI, the backend provides:
+```bash
+cd client
+npm ci
+npm run dev
+```
 
-- `/generate-context` - Main endpoint for generating geospatial context
-- `/health` - Health check endpoint
-- `/version` - Version information endpoint
-- CORS support for web applications
-- Memory and timeout constraints for free-tier hosting
+The frontend uses `/api` by default. Next.js rewrites that path to the local
+backend in development. Set `NEXT_PUBLIC_BACKEND_URL` only when intentionally
+using a different API origin.
 
-## Frontend
+## API
 
-The frontend is a Next.js application located in the `client/` directory that provides:
+`POST /generate-context` accepts a JSON body with `geojson` and optional query
+parameters:
 
-- Interactive map interface
-- GeoJSON upload capability
-- Visual feedback for analysis results
-- Responsive design
+- `datasets=dem,landcover,ndvi` selects which data modules run. Available
+  values are `dem`, `landcover`, `ndvi`, `soils`, `population`, `climate`, and
+  `hydrology`; omitted defaults to the three core modules.
+- `include_ndvi=false` skips NDVI even if it is selected.
+- `include_narrative=true` enables Gemini narrative generation.
+- `audience=academic|investor|farmer|policy` selects the narrative audience.
 
-## Technologies Used
+`GET /health` reports service readiness and `GET /version` describes active
+limits.
 
-### Backend
-- FastAPI
-- Rasterio
-- PySTAC Client
-- Microsoft Planetary Computer
-- ODC STAC
-- Google Generative AI
-- XArray, RioxArray
+## Production
 
-### Frontend
-- Next.js
-- React
-- Leaflet
-- Tailwind CSS
-
-## Setup
-
-### Backend Setup
-
-1. Clone the repository
-2. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Set up environment variables:
-   ```bash
-   cp .env.example .env
-   # Edit .env to add your GEMINI_API_KEY
-   ```
-4. Run the server:
-   ```bash
-   uvicorn main:app --reload
-   ```
-
-### Frontend Setup
-
-1. Navigate to the client directory:
-   ```bash
-   cd client
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Set environment variable to use the deployed backend:
-   ```bash
-   export NEXT_PUBLIC_BACKEND_URL=https://describeyourarea-production.up.railway.app
-   ```
-4. Run the development server:
-   ```bash
-   npm run dev
-   ```
-
-## API Endpoints
-
-- `POST /generate-context` - Generate geospatial context for a GeoJSON area
-- `GET /health` - Health check
-- `GET /version` - Version information
-
-## Parameters
-
-The `/generate-context` endpoint accepts:
-- `geojson`: GeoJSON object defining the area of interest
-- `include_narrative`: Boolean to include AI-generated narrative
-- `audience`: Target audience for narrative ("academic", "investor", "farmer", "policy")
-- `include_ndvi`: Boolean to include NDVI analysis
-
-## Architecture
-
-The system leverages Microsoft Planetary Computer to access:
-- NASADEM for elevation data
-- ESA WorldCover for landcover classification
-- Sentinel-2 L2A for NDVI analysis
-- MODIS as fallback for NDVI when needed
-
-## Constraints
-
-The system includes several constraints for reliable operation on free-tier hosting:
-- Maximum area size of 10 km² for NDVI analysis
-- Timeout protection with 15-second limits
-- Memory-safe processing with chunked operations
-- Fallback mechanisms when constraints are exceeded
+See [DEPLOYMENT.md](DEPLOYMENT.md). The Compose configuration binds app ports
+only to loopback and expects Nginx to proxy the frontend and `/api/` route.

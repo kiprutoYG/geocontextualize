@@ -2,7 +2,7 @@
 
 import { useState, useRef } from 'react';
 import dynamic from 'next/dynamic';
-import { Search, MapPin, Loader2, Globe, Satellite, Download } from 'lucide-react';
+import { Search, MapPin, Loader2, Globe, Satellite } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -10,7 +10,6 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Label } from '@/components/ui/label';
-import { Badge } from '@/components/ui/badge';
 import { Feature, FeatureCollection, Geometry } from "geojson";
 import CopySummary from '@/components/Copy';
 import { useToast } from '@/hooks/use-toast';
@@ -44,6 +43,11 @@ interface BoundingBox {
   west: number;
 }
 
+interface AnalysisWarning {
+  message: string;
+  status?: string;
+}
+
 export default function Home() {
    const { toast } = useToast();
    const [searchQuery, setSearchQuery] = useState('');
@@ -54,6 +58,7 @@ export default function Home() {
    const [boundingBox, setBoundingBox] = useState<BoundingBox | null>(null);
    const [isLoading, setIsLoading] = useState(false);
    const [response, setResponse] = useState<string>('');
+   const [analysisWarnings, setAnalysisWarnings] = useState<AnalysisWarning[]>([]);
    const [isSearching, setIsSearching] = useState(false);
    const [audience, setAudience] = useState<string>('academic');
    const [summaryType, setSummaryType] = useState<'raw' | 'narrative'>('narrative');
@@ -110,7 +115,7 @@ export default function Home() {
   };
 
   // Handle bounding box creation from map
-  const handleBoundingBoxCreated = (bbox: BoundingBox) => {
+  const handleBoundingBoxCreated = (bbox: BoundingBox | null) => {
     setBoundingBox(bbox);
   };
 
@@ -158,15 +163,16 @@ export default function Home() {
   // }
 
   interface NdviStats {
-  mean: number;
-  min: number;
-  max: number;
-  std: number;
+  mean?: number;
+  min?: number;
+  max?: number;
+  std?: number;
   p25?: number;
   p75?: number;
   scene_count?: number;
   resolution_m?: number;
   method?: string;
+  status?: string;
   warning?: string;
   }
 
@@ -217,9 +223,12 @@ export default function Home() {
     if (ndvi.method) {
       lines.push(`NDVI method: ${ndvi.method}.`);
     }
-    if (ndvi.warning) {
-      lines.push(`Note: ${ndvi.warning}.`);
-    }
+  }
+  if (ndvi?.warning) {
+    const prefix = ndvi.status === 'skipped'
+      ? 'Vegetation analysis was skipped'
+      : 'Vegetation analysis note';
+    lines.push(`${prefix}: ${ndvi.warning}.`);
   }
 
   // 4. Landcover breakdown
@@ -271,20 +280,24 @@ export default function Home() {
 
   // Send request to backend
   const handleAnalyze = async () => {
-    if ( !uploadedGeojson && !boundingBox) return;
+    if (!uploadedGeojson && !drawnFeatures?.features.length && !boundingBox) return;
 
     setIsLoading(true);
     setResponse('');
+    setAnalysisWarnings([]);
 
     try {
-      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+      // Same-origin requests work through the reverse proxy in production and
+      // through the Next.js rewrite in local Docker development.
+      const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || '/api').replace(/\/$/, '');
       let geojson;
-      // Construct GeoJSON polygon from boundingBox
+      // Preserve the source geometry whenever one was supplied. A bounding box
+      // is only a fallback for selections created by older map interactions.
       if (uploadedGeojson) {
-      // use the uploaded file directly
-      geojson = uploadedGeojson;
+        geojson = uploadedGeojson;
+      } else if (drawnFeatures?.features.length) {
+        geojson = drawnFeatures;
       } else if (boundingBox) {
-        // construct from bbox
         geojson = {
           type: "Feature",
           geometry: {
@@ -317,8 +330,11 @@ export default function Home() {
       if (!response.ok) throw new Error(`HTTP error! ${response.status}`);
 
       const data = await response.json();
-      setResponse(summarizeData(data.summary, data.narrative));
-      setSummaryText(summarizeData(data.summary, data.narrative));
+      const result = summarizeData(data.summary, data.narrative);
+      const ndviWarning = data?.summary?.ndvi?.warning;
+      setAnalysisWarnings(ndviWarning ? [{ message: ndviWarning, status: data?.summary?.ndvi?.status }] : []);
+      setResponse(result);
+      setSummaryText(result);
       } catch (err) {
         console.error(err);
         setSummaryText("Error: " + (err as Error).message);
@@ -420,7 +436,7 @@ export default function Home() {
                 </div>
                 <div className="flex items-start">
                   <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">3</div>
-                  <p className="text-sm">Use the drawing tool to create a bounding box on the map</p>
+                  <p className="text-sm">Draw a polygon or rectangle to define the area to analyze</p>
                 </div>
                 <div className="flex items-start">
                   <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">4</div>
@@ -520,7 +536,7 @@ export default function Home() {
             {/* Analyze Button */}
             <Button
               onClick={handleAnalyze}
-              disabled={!boundingBox && !uploadedGeojson || isLoading}
+              disabled={(!boundingBox && !uploadedGeojson && !drawnFeatures?.features.length) || isLoading}
               className="w-full bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white py-6 text-lg font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isLoading ? (
@@ -587,6 +603,14 @@ export default function Home() {
                 {summaryText && <CopySummary summaryText={summaryText} />}
               </CardHeader>
               <CardContent>
+                {analysisWarnings.map((warning) => (
+                  <Alert key={warning.message} className="mb-4 border-amber-300 bg-amber-50">
+                    <Satellite className="h-4 w-4 text-amber-700" />
+                    <AlertDescription className="text-amber-900">
+                      <strong>{warning.status === 'skipped' ? 'Vegetation analysis was skipped:' : 'Vegetation analysis note:'}</strong> {warning.message}
+                    </AlertDescription>
+                  </Alert>
+                ))}
                 <div className="bg-black/20 rounded-lg p-4 min-h-[200px]">
                   {isLoading ? (
                     <div className="flex items-center justify-center h-48">

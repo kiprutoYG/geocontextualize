@@ -1,9 +1,10 @@
 # --------------------------------------------------
 # IMPORTS (CRITICAL FIX: rioxarray import)
 # --------------------------------------------------
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any, Optional, Union, List, Literal
+from typing import Dict, Any, Optional, Literal
 import rasterio as rio
 from rasterio.mask import mask
 import numpy as np
@@ -18,12 +19,13 @@ import os
 from dotenv import load_dotenv
 import google.generativeai as genai
 import sys
-from shapely.geometry import shape
+from shapely.geometry import box, mapping, shape
+from shapely.ops import unary_union
+from pyproj import Geod
 import requests
 
 # Datacube imports (CRITICAL: rioxarray registers .rio accessor)
 from odc.stac import load as stac_load
-import xarray as xr
 import rioxarray  # MUST be imported to enable .rio methods
 
 # Optional imports for external datasets
@@ -34,163 +36,50 @@ except ImportError:
     OVERPY_AVAILABLE = False
 
 # --------------------------------------------------
-# ADDITIONAL IMPORTS & EOPF SETUP
-# --------------------------------------------------
-import pandas as pd
-import hashlib
-import pickle
-from pathlib import Path
-import time
-
-# EOPF optional imports
-try:
-    from pystac_client import Client as EopfClient
-    EOPF_AVAILABLE = True
-except ImportError:
-    EOPF_AVAILABLE = False
-
-# Caching configuration
-CACHE_DIR = Path(".cache")
-SCENE_CACHE = CACHE_DIR / "scenes"
-SCENE_CACHE.mkdir(parents=True, exist_ok=True)
-
-def get_scene_cache_key(collection: str, bbox: list, datetime_range: str, query: dict) -> str:
-    """Generate deterministic cache key for scene search."""
-    key_str = f"{collection}_{bbox}_{datetime_range}_{json.dumps(query, sort_keys=True)}"
-    return hashlib.md5(key_str.encode()).hexdigest()[:16]
-
-def get_or_search_scenes(
-    catalog: pystac_client.Client,
-    bbox: list,
-    collection: str,
-    datetime_range: str,
-    query: dict,
-    limit: int = 8,
-) -> pd.DataFrame:
-    """Get scene metadata with caching."""
-    cache_key = get_scene_cache_key(collection, bbox, datetime_range, query)
-    cache_file = SCENE_CACHE / f"{cache_key}.parquet"
-
-    if cache_file.exists():
-        try:
-            df = pd.read_parquet(cache_file)
-            print(f"[Cache] Loaded {len(df)} scenes from {cache_file.name}")
-            return df
-        except Exception as e:
-            print(f"[Cache] Failed to read {cache_file}: {e}, refetching")
-
-    search = catalog.search(
-        collections=[collection],
-        bbox=bbox,
-        datetime=datetime_range,
-        query=query,
-        fields={"include": ["id", "geometry", "properties", "assets"]}
-    )
-    items = list(search.get_items())
-    unique_items = {item.id: item for item in items}
-    items = list(unique_items.values())
-
-    records = []
-    for item in items:
-        records.append({
-            "scene_id": item.id,
-            "datetime": item.datetime,
-            "geometry": item.geometry,
-            "item_json": item.to_dict(),
-            "cloud_cover": item.properties.get("eo:cloud_cover", 100),
-            "collection": item.collection_id,
-        })
-
-    df = pd.DataFrame(records)
-    if not df.empty:
-        df.to_parquet(cache_file)
-        print(f"[Fetch] Got {len(df)} scenes, cached to {cache_file.name}")
-
-    return df
-
-def select_best_scene(
-    scenes_df: pd.DataFrame,
-    aoi_geom,
-    target_date=None,
-    min_coverage: float = 0.5,
-) -> Optional[dict]:
-    """Score scenes by coverage, cloud, and date; return best or None."""
-    aoi_area = aoi_geom.area
-    scored = []
-
-    for _, row in scenes_df.iterrows():
-        try:
-            scene_geom = shape(row["geometry"])
-        except Exception:
-            continue
-        if not scene_geom.intersects(aoi_geom):
-            continue
-        try:
-            intersection = scene_geom.intersection(aoi_geom)
-            cover_pct = intersection.area / aoi_area
-        except Exception:
-            continue
-        if cover_pct < min_coverage:
-            continue
-
-        date_score = 1.0
-        if target_date is not None:
-            scene_dt = row["datetime"] if row["datetime"].tzinfo else row["datetime"].tz_localize("UTC")
-            date_diff = abs((scene_dt - target_date).total_seconds() / 86400)
-            date_score = max(0.0, 1.0 - date_diff / 60.0)
-
-        cloud_score = 1.0 - (row["cloud_cover"] / 100.0)
-        score = 0.5 * cover_pct + 0.3 * date_score + 0.2 * cloud_score
-        scored.append({**row.to_dict(), "cover_pct": cover_pct, "score": score})
-
-    return max(scored, key=lambda x: x["score"]) if scored else None
-
-def load_scene_data(
-    item: pystac.Item,
-    bbox: list,
-    bands: list,
-    resolution_deg: float,
-) -> Optional[xr.Dataset]:
-    """Load bands from a single STAC item, clipped to bbox."""
-    try:
-        ds = stac_load(
-            [item],
-            bands=bands,
-            bbox=bbox,
-            crs="EPSG:4326",
-            resolution=resolution_deg,
-            chunks={"x": 512, "y": 512},
-            patch_url=planetary_computer.sign,
-            dtype="uint16",
-            groupby="solar_day",
-            skip_broken=True,
-        )
-        if ds is None or len(ds.time) == 0:
-            return None
-        if "time" in ds.dims:
-            ds = ds.isel(time=0).drop_vars("time")
-        return ds
-    except Exception as e:
-        print(f"⚠️ Failed to load scene {item.id}: {e}", file=sys.stderr)
-        return None
-
-# --------------------------------------------------
 # ENVIRONMENT
 # --------------------------------------------------
 load_dotenv()
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    """Read a positive integer setting without making a bad env value fatal."""
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    """Read a bounded float setting without making a bad env value fatal."""
+    try:
+        return max(minimum, float(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+# These caps keep synchronous browser requests predictable. A durable worker and
+# queue are required before offering larger, asynchronous study areas.
+MAX_GEOJSON_BYTES = _env_int("MAX_GEOJSON_BYTES", 500_000)
+MAX_AOI_VERTICES = _env_int("MAX_AOI_VERTICES", 10_000)
+MAX_SYNC_BBOX_KM2 = _env_float("MAX_SYNC_BBOX_KM2", 100.0)
+MAX_NDVI_BBOX_KM2 = _env_float("MAX_NDVI_BBOX_KM2", 10.0)
+MAX_PC_SCENES = _env_int("MAX_PC_SCENES", 4)
+MAX_CONCURRENT_ANALYSES = _env_int("MAX_CONCURRENT_ANALYSES", 1)
+ANALYSIS_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
+WGS84_GEOD = Geod(ellps="WGS84")
 
 # --------------------------------------------------
 # APP CONFIGURATION
 # --------------------------------------------------
 app = FastAPI(title="GeoContext Generator API")
 
-# CRITICAL FIX: Strip whitespace from origins
+# Explicit origins are required because the API permits credentialed requests.
+# Production uses same-origin /api behind Nginx, but this also supports local dev.
 origins = [
-    "https://describearea.vercel.app    ",
-    "http://localhost:3000",
-    "http://209.38.197.161:3000",
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
 ]
-origins = [origin.strip() for origin in origins if origin.strip()]
 
 app.add_middleware(
     CORSMiddleware,
@@ -202,6 +91,26 @@ app.add_middleware(
 
 # CRITICAL FIX: Strip whitespace from STAC URL
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1    ".strip()
+
+
+@app.middleware("http")
+async def limit_analysis_concurrency(request: Request, call_next):
+    """Bound costly STAC/raster work before it reaches shared public services."""
+    if request.url.path != "/generate-context":
+        return await call_next(request)
+
+    try:
+        await asyncio.wait_for(ANALYSIS_SEMAPHORE.acquire(), timeout=2.0)
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Analysis capacity is busy. Please retry shortly."},
+        )
+
+    try:
+        return await call_next(request)
+    finally:
+        ANALYSIS_SEMAPHORE.release()
 
 # --------------------------------------------------
 # SCHEMAS
@@ -237,14 +146,151 @@ def label_landcover(percentages: Dict[str, float]) -> Dict[str, float]:
     }
 
 # --------------------------------------------------
-# HELPERS
+# AOI ADMISSION AND GEOMETRY HELPERS
 # --------------------------------------------------
+def _position_count(coordinates: Any) -> int:
+    """Count GeoJSON positions without assuming Polygon nesting depth."""
+    if not isinstance(coordinates, (list, tuple)):
+        return 0
+    if coordinates and all(isinstance(value, (int, float)) for value in coordinates):
+        return 1
+    return sum(_position_count(value) for value in coordinates)
+
+
+def _polygon_geometry(value: Any):
+    """Return a validated Shapely Polygon/MultiPolygon or raise a client error."""
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Each GeoJSON feature must be an object")
+
+    geometry = value.get("geometry") if value.get("type") == "Feature" else value
+    if not isinstance(geometry, dict):
+        raise HTTPException(status_code=400, detail="GeoJSON feature is missing a geometry")
+    if geometry.get("type") not in {"Polygon", "MultiPolygon"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Only Polygon and MultiPolygon study areas are supported",
+        )
+
+    try:
+        geom = shape(geometry)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid GeoJSON geometry") from exc
+
+    if geom.is_empty or not geom.is_valid:
+        raise HTTPException(status_code=400, detail="Study-area geometry is empty or invalid")
+    return geom
+
+
+def canonicalize_geojson(
+    geojson: dict,
+    *,
+    max_bytes: int = MAX_GEOJSON_BYTES,
+    max_vertices: int = MAX_AOI_VERTICES,
+) -> dict:
+    """Canonicalize supported GeoJSON into one Feature for every raster call.
+
+    FeatureCollections are unioned rather than silently discarding all but the
+    first polygon. This also lets uploaded MultiPolygons follow the same path
+    as shapes drawn in the browser.
+    """
+    if not isinstance(geojson, dict):
+        raise HTTPException(status_code=400, detail="GeoJSON must be an object")
+
+    try:
+        payload_size = len(json.dumps(geojson, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="GeoJSON is not JSON serializable") from exc
+    if payload_size > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Study-area payload exceeds the {max_bytes} byte limit",
+        )
+
+    input_type = geojson.get("type")
+    if input_type == "FeatureCollection":
+        features = geojson.get("features")
+        if not isinstance(features, list) or not features:
+            raise HTTPException(status_code=400, detail="FeatureCollection must contain polygons")
+        geometries = [_polygon_geometry(feature) for feature in features]
+        properties: dict[str, Any] = {}
+    elif input_type in {"Feature", "Polygon", "MultiPolygon"}:
+        geometries = [_polygon_geometry(geojson)]
+        properties = geojson.get("properties", {}) if input_type == "Feature" else {}
+        if not isinstance(properties, dict):
+            properties = {}
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="GeoJSON must be a Feature, FeatureCollection, Polygon, or MultiPolygon",
+        )
+
+    vertex_count = sum(_position_count(mapping(geom).get("coordinates")) for geom in geometries)
+    if vertex_count > max_vertices:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Study area has too many vertices (limit: {max_vertices})",
+        )
+
+    merged = unary_union(geometries)
+    if merged.is_empty or merged.geom_type not in {"Polygon", "MultiPolygon"} or not merged.is_valid:
+        raise HTTPException(status_code=400, detail="Study-area polygons cannot be combined safely")
+
+    return {
+        "type": "Feature",
+        "properties": properties,
+        "geometry": mapping(merged),
+    }
+
+
+def aoi_bbox(feature: dict) -> list[float]:
+    """Derive bounds from canonical geometry; handles Polygon and MultiPolygon."""
+    geom = _polygon_geometry(feature)
+    minx, miny, maxx, maxy = geom.bounds
+    if minx < -180 or maxx > 180 or miny < -90 or maxy > 90 or minx >= maxx or miny >= maxy:
+        raise HTTPException(status_code=400, detail="Study-area coordinates must be valid WGS84 longitude/latitude")
+    return [float(minx), float(miny), float(maxx), float(maxy)]
+
+
+def _bbox_area_km2(bbox: list[float]) -> float:
+    """Geodesic area of the bounding box used by STAC and raster reads."""
+    minx, miny, maxx, maxy = bbox
+    area_m2, _ = WGS84_GEOD.geometry_area_perimeter(box(minx, miny, maxx, maxy))
+    return abs(area_m2) / 1_000_000
+
+
+def validate_aoi(
+    geojson: dict,
+    *,
+    max_bytes: int = MAX_GEOJSON_BYTES,
+    max_vertices: int = MAX_AOI_VERTICES,
+    max_bbox_km2: float = MAX_SYNC_BBOX_KM2,
+) -> dict:
+    """Apply payload, vertex, and synchronous bounding-box admission limits."""
+    feature = canonicalize_geojson(
+        geojson,
+        max_bytes=max_bytes,
+        max_vertices=max_vertices,
+    )
+    bbox = aoi_bbox(feature)
+    bbox_area_km2 = _bbox_area_km2(bbox)
+    if bbox_area_km2 > max_bbox_km2:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Study-area bounding box is {bbox_area_km2:.1f} km²; "
+                f"the synchronous limit is {max_bbox_km2:g} km²"
+            ),
+        )
+    return {
+        "feature": feature,
+        "bbox": bbox,
+        "bbox_area_km2": bbox_area_km2,
+    }
+
+
 def normalize_geojson(geojson: dict) -> dict:
-    if geojson.get("type") == "FeatureCollection":
-        return geojson["features"][0]
-    if geojson.get("type") == "Feature":
-        return geojson
-    raise HTTPException(status_code=400, detail="Unsupported GeoJSON type")
+    """Backward-compatible name for callers that only need the canonical feature."""
+    return canonicalize_geojson(geojson)
 
 def compute_raster_stats(asset_href: str, geojson: dict) -> Dict[str, float]:
     try:
@@ -325,339 +371,167 @@ def compute_landcover_percentages(asset_href: str, geojson: dict) -> Dict[str, A
         return {"error": str(e)}
 
 # --------------------------------------------------
-# NDVI COMPUTATION: PC OPTIMIZED + EOPF FALLBACK
+# NDVI COMPUTATION: BOUNDED PLANETARY COMPUTER WORKFLOW
 # --------------------------------------------------
+async def _search_sentinel_items(bbox: list[float], max_scenes: int) -> list:
+    """Fetch a deliberately small scene set, retrying only transient failures."""
+    end = datetime.datetime.now(datetime.UTC)
+    start = end - datetime.timedelta(days=90)
+    time_window = f"{start.date().isoformat()}/{end.date().isoformat()}"
 
-async def compute_ndvi_pc_optimized(
-    bbox: list,
-    geojson_geom: dict,
-    max_area_km2: float = 100.0,
-    max_scenes: int = 8,
-    resolution_m: int = 20,
-) -> dict | None:
-    """Optimized PC NDVI with caching and best-scene selection."""
-    try:
-        minx, miny, maxx, maxy = bbox
-        width_km = (maxx - minx) * 111.32
-        height_km = (maxy - miny) * 111.32
-        area_km2 = width_km * height_km
-        if area_km2 > max_area_km2:
-            print(f"⚠️ Skipping NDVI (PC): area {area_km2:.1f}km² > limit", file=sys.stderr)
-            return None
-
-        end = datetime.datetime.utcnow()
-        start = end - datetime.timedelta(days=90)
-        time_window = f"{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
-
-        catalog = pystac_client.Client.open(STAC_URL, modifier=planetary_computer.sign_inplace)
-        query = {"eo:cloud_cover": {"lt": 30}}
-        scenes_df = get_or_search_scenes(
-            catalog=catalog,
-            bbox=bbox,
-            collection="sentinel-2-l2a",
-            datetime_range=time_window,
-            query=query,
-            limit=max_scenes * 2,
-        )
-
-        if scenes_df.empty:
-            print("⚠️ No scenes found in PC catalog", file=sys.stderr)
-            return None
-
-        best = select_best_scene(scenes_df, shape(geojson_geom), target_date=end, min_coverage=0.5)
-        if best is None:
-            print("⚠️ No single scene meets coverage threshold, trying composite", file=sys.stderr)
-            return await _compute_ndvi_pc_composite(scenes_df.head(3), bbox, geojson_geom, resolution_m)
-
-        print(f"✅ Selected PC scene: {best['scene_id'][:30]}... (cover={best['cover_pct']*100:.0f}%, cloud={best['cloud_cover']:.0f}%)", file=sys.stderr)
-
-        item = pystac.Item.from_dict(best["item_json"])
-        resolution_deg = resolution_m / 111320.0
-        ds = await asyncio.to_thread(load_scene_data, item, bbox, ["B04", "B08", "SCL"], resolution_deg)
-        if ds is None:
-            return None
-
-        ndvi = (ds.B08 - ds.B04) / (ds.B08 + ds.B04 + 1e-8)
-        ndvi = ndvi.rio.write_crs("EPSG:4326")
-        ndvi_clipped = ndvi.rio.clip([geojson_geom], crs="EPSG:4326", all_touched=True)
-        valid_mask = ds.SCL.isin([4, 5, 6, 7, 11])
-        ndvi_clipped = ndvi_clipped.where(valid_mask)
-
-        def _stats():
-            arr = ndvi_clipped.values.astype(float)
-            arr = arr[~np.isnan(arr) & (arr > -1) & (arr < 1)]
-            if arr.size == 0:
-                return None
-            return {
-                "mean": float(np.mean(arr)),
-                "min": float(np.nanmin(arr)),
-                "max": float(np.nanmax(arr)),
-                "std": float(np.nanstd(arr)),
-                "p25": float(np.percentile(arr, 25)),
-                "p75": float(np.percentile(arr, 75)),
-                "scene_count": 1,
-                "resolution_m": resolution_m,
-                "method": "pc_single_scene",
-                "scene_id": best["scene_id"],
-                "scene_date": best["datetime"].isoformat() if hasattr(best["datetime"], "isoformat") else str(best["datetime"]),
-                "scene_platform": best.get("platform", "sentinel-2"),
-            }
-
-        return await asyncio.wait_for(asyncio.to_thread(_stats), timeout=25.0)
-
-    except asyncio.TimeoutError:
-        print("⚠️ NDVI PC TIMEOUT", file=sys.stderr)
-        return None
-    except MemoryError:
-        print("⚠️ NDVI PC MEMORY ERROR", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"⚠️ NDVI PC FAILED {type(e).__name__}: {str(e)[:150]}", file=sys.stderr)
-        return None
-
-async def _compute_ndvi_pc_composite(
-    scenes_df: pd.DataFrame,
-    bbox: list,
-    geojson_geom: dict,
-    resolution_m: int,
-) -> dict | None:
-    """Fallback composite from top N scenes."""
-    try:
-        resolution_deg = resolution_m / 111320.0
-        items = []
-        for _, row in scenes_df.iterrows():
-            try:
-                items.append(pystac.Item.from_dict(row["item_json"]))
-            except Exception:
-                continue
-        if not items:
-            return None
-
-        data = stac_load(
-            items,
-            bands=["B04", "B08", "SCL"],
-            bbox=bbox,
-            crs="EPSG:4326",
-            resolution=resolution_deg,
-            chunks={"x": 512, "y": 512},
-            patch_url=planetary_computer.sign,
-            dtype="uint16",
-            groupby="solar_day",
-            skip_broken=True,
-        )
-        if data is None or len(data.time) == 0:
-            return None
-
-        valid_mask = data.SCL.isin([4, 5, 6, 7, 11])
-        ndvi = (data.B08 - data.B04) / (data.B08 + data.B04 + 1e-8)
-        ndvi = ndvi.rio.write_crs("EPSG:4326")
-        ndvi_clipped = ndvi.rio.clip([geojson_geom], crs="EPSG:4326", all_touched=True)
-        ndvi_clipped = ndvi_clipped.where(valid_mask)
-        median_ndvi = ndvi_clipped.median(dim="time")
-
-        def _stats():
-            arr = median_ndvi.values.astype(float)
-            arr = arr[~np.isnan(arr) & (arr > -1) & (arr < 1)]
-            if arr.size == 0:
-                return None
-            return {
-                "mean": float(np.mean(arr)),
-                "min": float(np.nanmin(arr)),
-                "max": float(np.nanmax(arr)),
-                "std": float(np.nanstd(arr)),
-                "p25": float(np.percentile(arr, 25)),
-                "p75": float(np.percentile(arr, 75)),
-                "scene_count": len(items),
-                "resolution_m": resolution_m,
-                "method": "pc_composite",
-                "scene_ids": [it.id for it in items],
-                "scene_dates": [it.datetime.isoformat() if hasattr(it.datetime, "isoformat") else str(it.datetime) for it in items],
-            }
-
-        return await asyncio.wait_for(asyncio.to_thread(_stats), timeout=60.0)
-
-    except Exception as e:
-        print(f"⚠️ NDVI PC COMPOSITE FAILED: {type(e).__name__}: {str(e)[:150]}", file=sys.stderr)
-        return None
-
-async def compute_ndvi_eopf(
-    bbox: list,
-    geojson_geom: dict,
-    max_area_km2: float = 100.0,
-    max_scenes: int = 8,
-    resolution_m: int = 20,
-) -> dict | None:
-    """EOPF Sentinel Zarr NDVI."""
-    if not EOPF_AVAILABLE:
-        print("⚠️ EOPF not available (xarray-eopf missing)", file=sys.stderr)
-        return None
-
-    try:
-        minx, miny, maxx, maxy = bbox
-        width_km = (maxx - minx) * 111.32
-        height_km = (maxy - miny) * 111.32
-        area_km2 = width_km * height_km
-        if area_km2 > max_area_km2:
-            print(f"⚠️ Skipping NDVI (EOPF): area {area_km2:.1f}km² > limit", file=sys.stderr)
-            return None
-
-        catalog = EopfClient.open('https://stac.core.eopf.eodc.eu/')
-        end = datetime.datetime.utcnow()
-        start = end - datetime.timedelta(days=90)
-        time_window = f"{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
-
+    def search_once() -> list:
+        catalog = pystac_client.Client.open(STAC_URL)
         search = catalog.search(
-            collections='sentinel-2-l2a',
+            collections=["sentinel-2-l2a"],
             bbox=bbox,
             datetime=time_window,
-            limit=max_scenes
+            query={"eo:cloud_cover": {"lt": 30}},
+            limit=max_scenes,
+            max_items=max_scenes,
         )
-        items = list(search.items())
-        if not items:
-            print("⚠️ No scenes in EOPF catalog", file=sys.stderr)
-            return None
+        return list(search.items())
 
-        records = []
-        for item in items:
-            records.append({
-                "scene_id": item.id,
-                "datetime": item.datetime,
-                "geometry": item.geometry,
-                "cloud_cover": item.properties.get("eo:cloud_cover", 100),
-            })
-        scenes_df = pd.DataFrame(records)
-
-        best = select_best_scene(scenes_df, shape(geojson_geom), target_date=end, min_coverage=0.5)
-        if best is None:
-            return await _compute_ndvi_eopf_composite(items[:3], bbox, geojson_geom, resolution_m)
-
-        print(f"✅ EOPF selected scene: {best['scene_id'][:30]}... (cover={best['cover_pct']*100:.0f}%)", file=sys.stderr)
-
-        item = next((i for i in items if i.id == best["scene_id"]), None)
-        if item is None:
-            return None
-
-        zarr_asset = item.assets.get('product')
-        if not zarr_asset:
-            for key, asset in item.assets.items():
-                media = getattr(asset, 'media_type', None)
-                if media == 'application/vnd+zarr':
-                    zarr_asset = asset
-                    break
-        if not zarr_asset:
-            print("⚠️ No Zarr asset in EOPF item", file=sys.stderr)
-            return None
-
-        zarr_url = zarr_asset.href
-
-        if not hasattr(compute_ndvi_eopf, "_zarr_cache"):
-            compute_ndvi_eopf._zarr_cache = {}
-        cache = compute_ndvi_eopf._zarr_cache
-
-        if item.id not in cache:
-            try:
-                dt = xr.open_datatree(zarr_url, engine='eopf-zarr', chunks='auto')
-                cache[item.id] = dt
-            except Exception as e:
-                print(f"⚠️ Failed to open Zarr: {e}", file=sys.stderr)
-                return None
-        else:
-            dt = cache[item.id]
-
+    for attempt in range(3):
         try:
-            ds = dt['/measurements/reflectance/r20m'].to_dataset()
-        except Exception as e:
-            print(f"⚠️ Cannot access reflectance: {e}", file=sys.stderr)
-            return None
+            items = await asyncio.to_thread(search_once)
+            return sorted(
+                items[:max_scenes],
+                key=lambda item: item.properties.get("eo:cloud_cover", 100),
+            )
+        except Exception as exc:
+            if attempt == 2:
+                print(
+                    f"⚠️ Planetary Computer scene search failed: {type(exc).__name__}: {str(exc)[:120]}",
+                    file=sys.stderr,
+                )
+                return []
+            await asyncio.sleep(0.5 * (2 ** attempt))
+    return []
 
-        # Determine CRS
-        if hasattr(ds, 'rio') and ds.rio.crs is not None:
-            dst_crs = ds.rio.crs
-        else:
-            epsg = item.properties.get('proj:epsg')
-            if epsg:
-                dst_crs = f"EPSG:{epsg}"
-            else:
-                print("⚠️ Cannot determine dataset CRS for EOPF", file=sys.stderr)
-                return None
 
-        from shapely.ops import transform
-        import pyproj
-        project = pyproj.Transformer.from_crs("EPSG:4326", dst_crs, always_xy=True).transform
-        aoi_utm = transform(project, shape(geojson_geom))
-        minx, miny, maxx, maxy = aoi_utm.bounds
-
-        x_sel = ds.x.sel(x=slice(minx, maxx))
-        y_sel = ds.y.sel(y=slice(miny, maxy))
-        if len(x_sel) == 0 or len(y_sel) == 0:
-            print("⚠️ AOI out of EOPF dataset bounds", file=sys.stderr)
-            return None
-
-        subset = ds.sel(x=slice(minx, maxx), y=slice(miny, maxy))
-        loaded = subset.compute()
-
-        red = loaded['b04']
-        nir = loaded['b8a']
-        valid = (red > 0) & (nir > 0)
-        ndvi = xr.where(valid, (nir - red) / (nir + red), np.nan)
-
-        def _stats():
-            arr = ndvi.values.astype(float)
-            arr = arr[~np.isnan(arr) & (arr > -1) & (arr < 1)]
-            if arr.size == 0:
-                return None
-            return {
-                "mean": float(np.mean(arr)),
-                "min": float(np.nanmin(arr)),
-                "max": float(np.nanmax(arr)),
-                "std": float(np.nanstd(arr)),
-                "p25": float(np.percentile(arr, 25)),
-                "p75": float(np.percentile(arr, 75)),
-                "scene_count": 1,
-                "resolution_m": resolution_m,
-                "method": "eopf_zarr",
-                "scene_id": item.id,
-                "scene_date": item.datetime.isoformat() if hasattr(item.datetime, "isoformat") else str(item.datetime),
-                "scene_platform": item.properties.get('platform', 'sentinel-2'),
-            }
-
-        return await asyncio.wait_for(asyncio.to_thread(_stats), timeout=25.0)
-
-    except asyncio.TimeoutError:
-        print("⚠️ NDVI EOPF TIMEOUT", file=sys.stderr)
-        return None
-    except MemoryError:
-        print("⚠️ NDVI EOPF MEMORY ERROR", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"⚠️ NDVI EOPF FAILED {type(e).__name__}: {str(e)[:150]}", file=sys.stderr)
-        return None
-
-async def _compute_ndvi_eopf_composite(
+def _load_and_summarize_ndvi(
     items: list,
-    bbox: list,
+    bbox: list[float],
     geojson_geom: dict,
     resolution_m: int,
-) -> dict | None:
-    """Future: multi-scene composite from EOPF Zarr."""
-    return None
+) -> dict:
+    """Load only the bounded AOI, mask clouds before reduction, and summarize."""
+    resolution_deg = resolution_m / 111_320.0
+    data = stac_load(
+        items,
+        bands=["B04", "B08", "SCL"],
+        bbox=bbox,
+        crs="EPSG:4326",
+        resolution=resolution_deg,
+        chunks={"x": 512, "y": 512},
+        patch_url=planetary_computer.sign,
+        dtype="uint16",
+        groupby="solar_day",
+        skip_broken=True,
+    )
+    if data is None or data.sizes.get("time", 0) == 0:
+        return {
+            "status": "unavailable",
+            "source": "Planetary Computer",
+            "warning": "No usable Sentinel-2 pixels were available for this study area.",
+        }
+
+    clipped = data.rio.write_crs("EPSG:4326").rio.clip(
+        [geojson_geom],
+        crs="EPSG:4326",
+        all_touched=True,
+        drop=True,
+    )
+    valid_scene_classes = clipped["SCL"].isin([4, 5, 6, 7, 11])
+    # Sentinel reflectance arrives as uint16. Cast before subtracting so
+    # negative differences cannot wrap to a large unsigned value.
+    red = clipped["B04"].astype("float32")
+    nir = clipped["B08"].astype("float32")
+    ndvi = ((nir - red) / (nir + red + 1e-8)).where(
+        valid_scene_classes
+    )
+    median_ndvi = ndvi.median(dim="time", skipna=True)
+    values = median_ndvi.values.astype(float)
+    values = values[np.isfinite(values) & (values > -1) & (values < 1)]
+    if values.size == 0:
+        return {
+            "status": "unavailable",
+            "source": "Planetary Computer",
+            "warning": "Cloud and scene-quality masking left no valid Sentinel-2 pixels.",
+        }
+
+    scene_dates = [
+        item.datetime.isoformat() if getattr(item, "datetime", None) else None
+        for item in items
+    ]
+    return {
+        "status": "ok",
+        "source": "Planetary Computer",
+        "mean": float(np.mean(values)),
+        "min": float(np.min(values)),
+        "max": float(np.max(values)),
+        "std": float(np.std(values)),
+        "p25": float(np.percentile(values, 25)),
+        "p75": float(np.percentile(values, 75)),
+        "scene_count": len(items),
+        "resolution_m": resolution_m,
+        "method": "sentinel_2_median_composite",
+        "scene_ids": [item.id for item in items],
+        "scene_dates": [scene_date for scene_date in scene_dates if scene_date],
+    }
+
 
 async def compute_median_ndvi(
-    bbox: list,
+    bbox: list[float],
     geojson_geom: dict,
-    max_area_km2: float = 100.0,
-    max_scenes: int = 8,
+    max_area_km2: float = MAX_NDVI_BBOX_KM2,
+    max_scenes: int = MAX_PC_SCENES,
     resolution_m: int = 20,
-) -> dict | None:
-    """Orchestrator: try EOPF first, fall back to PC optimized."""
-    if EOPF_AVAILABLE:
-        result = await compute_ndvi_eopf(bbox, geojson_geom, max_area_km2, max_scenes, resolution_m)
-        if result is not None:
-            print("✅ NDVI via EOPF Zarr", file=sys.stderr)
-            return result
-        print("⚠️ EOPF failed, falling back to PC", file=sys.stderr)
+) -> dict:
+    """Compute a small Sentinel-2 composite from Planetary Computer only.
 
-    return await compute_ndvi_pc_optimized(bbox, geojson_geom, max_area_km2, max_scenes, resolution_m)
+    A skipped result is explicit: the application never falls back to an
+    unbounded MODIS raster read for a large study area.
+    """
+    bbox_area_km2 = _bbox_area_km2(bbox)
+    if bbox_area_km2 > max_area_km2:
+        return {
+            "status": "skipped",
+            "source": "Planetary Computer",
+            "bbox_area_km2": round(bbox_area_km2, 2),
+            "warning": (
+                f"NDVI is available for bounding boxes up to {max_area_km2:g} km²; "
+                "use a smaller study area for this synchronous analysis."
+            ),
+        }
+
+    bounded_scenes = min(MAX_PC_SCENES, max(1, int(max_scenes)))
+    items = await _search_sentinel_items(bbox, bounded_scenes)
+    if not items:
+        return {
+            "status": "unavailable",
+            "source": "Planetary Computer",
+            "warning": "No cloud-filtered Sentinel-2 scenes were available in the last 90 days.",
+        }
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_load_and_summarize_ndvi, items, bbox, geojson_geom, resolution_m),
+            timeout=75.0,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "status": "unavailable",
+            "source": "Planetary Computer",
+            "warning": "NDVI processing timed out; try a smaller study area shortly.",
+        }
+    except Exception as exc:
+        print(f"⚠️ NDVI processing failed: {type(exc).__name__}: {str(exc)[:120]}", file=sys.stderr)
+        return {
+            "status": "unavailable",
+            "source": "Planetary Computer",
+            "warning": "NDVI could not be processed for this study area right now.",
+        }
 
 # --------------------------------------------------
 # EXTERNAL DATASETS: Soils, Population, Climate, Hydrology
@@ -948,6 +822,61 @@ Population: GHS-POP (Global Human Settlement Layer) 100 m. Year: {pop.get('year'
 # --------------------------------------------------
 # API ENDPOINT
 # --------------------------------------------------
+AVAILABLE_DATASETS = {
+    "dem",
+    "landcover",
+    "ndvi",
+    "soils",
+    "population",
+    "climate",
+    "hydrology",
+}
+
+
+def _requested_datasets(value: Optional[str]) -> set[str]:
+    """Parse the existing comma-separated frontend selector safely."""
+    if value is None:
+        return {"dem", "landcover", "ndvi"}
+    requested = {name.strip().lower() for name in value.split(",") if name.strip()}
+    unknown = requested - AVAILABLE_DATASETS
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported datasets: {', '.join(sorted(unknown))}",
+        )
+    return requested
+
+
+async def _find_core_assets(
+    bbox: list[float],
+    *,
+    need_dem: bool,
+    need_landcover: bool,
+) -> dict[str, str]:
+    """Find just the COGs requested by the user; asset signing happens on read."""
+    def search() -> dict[str, str]:
+        catalog = pystac_client.Client.open(STAC_URL)
+        assets: dict[str, str] = {}
+        if need_dem:
+            dem_items = list(catalog.search(collections=["nasadem"], bbox=bbox, limit=1).items())
+            if not dem_items:
+                raise HTTPException(status_code=400, detail="No elevation data available for this area")
+            assets["dem"] = dem_items[0].assets["elevation"].href
+        if need_landcover:
+            lc_items = list(catalog.search(collections=["esa-worldcover"], bbox=bbox, limit=1).items())
+            if not lc_items:
+                raise HTTPException(status_code=400, detail="No land-cover data available for this area")
+            assets["landcover"] = lc_items[0].assets["map"].href
+        return assets
+
+    try:
+        return await asyncio.to_thread(search)
+    except HTTPException:
+        raise
+    except (KeyError, IndexError) as exc:
+        raise HTTPException(status_code=502, detail="A required raster asset was unavailable") from exc
+
+
 @app.post("/generate-context", response_model=ContextResponse)
 async def generate_context(
     request: GeoJSONRequest,
@@ -955,87 +884,74 @@ async def generate_context(
     audience: str = "academic",
     include_ndvi: bool = True,
     regulatory_framework: Optional[str] = None,
+    datasets: Optional[str] = None,
 ):
     try:
-        geojson = normalize_geojson(request.geojson)
+        requested = _requested_datasets(datasets)
+        aoi = validate_aoi(request.geojson)
+        geojson = aoi["feature"]
         geom = geojson["geometry"]
-        
-        coords = geom["coordinates"][0]
-        xs = [c[0] for c in coords]
-        ys = [c[1] for c in coords]
-        bbox = [min(xs), min(ys), max(xs), max(ys)]
+        bbox = aoi["bbox"]
 
-        catalog = pystac_client.Client.open(
-            STAC_URL,
-            modifier=planetary_computer.sign_inplace,
+        core_assets = await asyncio.wait_for(
+            _find_core_assets(
+                bbox,
+                need_dem="dem" in requested,
+                need_landcover="landcover" in requested,
+            ),
+            timeout=15.0,
         )
 
-        dem_items = list(
-            catalog.search(collections=["nasadem"], bbox=bbox, limit=1).items()
-        )
-        lc_items = list(
-            catalog.search(collections=["esa-worldcover"], bbox=bbox, limit=1).items()
-        )
-        
-        if not dem_items or not lc_items:
-            raise HTTPException(
-                status_code=400, 
-                detail="No elevation or landcover data available for this area"
+        raster_tasks: dict[str, Any] = {}
+        if "dem" in core_assets:
+            raster_tasks["dem"] = asyncio.to_thread(compute_raster_stats, core_assets["dem"], geojson)
+        if "landcover" in core_assets:
+            raster_tasks["landcover"] = asyncio.to_thread(
+                compute_landcover_percentages,
+                core_assets["landcover"],
+                geojson,
             )
-
-        dem_href = dem_items[0].assets["elevation"].href
-        lc_href = lc_items[0].assets["map"].href
-
-        # Process DEM + Landcover with timeout guardrail
         try:
-            raw_dem, landcover = await asyncio.wait_for(
-                asyncio.gather(
-                    asyncio.to_thread(compute_raster_stats, dem_href, geojson),
-                    asyncio.to_thread(compute_landcover_percentages, lc_href, geojson),
-                ),
-                timeout=20.0  # 20s buffer before Render 30s kill
-            )
+            raster_values = await asyncio.wait_for(
+                asyncio.gather(*raster_tasks.values()),
+                timeout=30.0,
+            ) if raster_tasks else []
         except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=504,
-                detail="Processing timeout (Render free tier limit). Try smaller area."
-            )
+            raise HTTPException(status_code=504, detail="Raster processing timed out; try a smaller area")
         except MemoryError:
-            raise HTTPException(
-                status_code=507,
-                detail="Memory exceeded (Render free tier limit). Reduce area size."
-            )
+            raise HTTPException(status_code=507, detail="Raster processing exceeded available memory")
+        raster_results = dict(zip(raster_tasks.keys(), raster_values))
+        dem = interpret_terrain(raster_results["dem"]) if "dem" in raster_results else None
+        landcover = raster_results.get("landcover")
 
-        dem = interpret_terrain(raw_dem)
-
-        # Compute NDVI (optimized pipeline)
         ndvi_stats = None
-        if include_ndvi:
+        if include_ndvi and "ndvi" in requested:
             ndvi_stats = await compute_median_ndvi(
                 bbox=bbox,
                 geojson_geom=geom,
-                max_area_km2=100.0,
-                max_scenes=8,
+                max_area_km2=MAX_NDVI_BBOX_KM2,
+                max_scenes=MAX_PC_SCENES,
                 resolution_m=20,
             )
-            if ndvi_stats is None:
-                print("⚠️ Falling back to MODIS NDVI (coarse resolution)", file=sys.stderr)
-                ndvi_stats = await compute_modis_ndvi_fallback(bbox)
 
-        # Fetch additional datasets in parallel
+        extra_tasks: dict[str, Any] = {}
+        if "soils" in requested:
+            extra_tasks["soils"] = fetch_soil_soc(bbox, geom)
+        if "population" in requested:
+            extra_tasks["population"] = fetch_population(bbox, geom)
+        if "climate" in requested:
+            extra_tasks["climate"] = fetch_climate(geom)
+        if "hydrology" in requested:
+            extra_tasks["hydrology"] = fetch_hydrology(bbox, geom)
         try:
-            soil_result, pop_result, climate_result, hydro_result = await asyncio.wait_for(
-                asyncio.gather(
-                    fetch_soil_soc(bbox, geom),
-                    fetch_population(bbox, geom),
-                    fetch_climate(geom),
-                    fetch_hydrology(bbox, geom),
-                ),
-                timeout=30.0  # total extra datasets budget
-            )
+            extra_values = await asyncio.wait_for(
+                asyncio.gather(*extra_tasks.values()),
+                timeout=30.0,
+            ) if extra_tasks else []
         except asyncio.TimeoutError:
-            print("⚠️ Extra datasets timeout, proceeding without them", file=sys.stderr)
-            soil_result = pop_result = climate_result = hydro_result = None
+            print("⚠️ Extra datasets timed out; returning the completed core analysis", file=sys.stderr)
+            extra_values = [None] * len(extra_tasks)
+        extra_results = dict(zip(extra_tasks.keys(), extra_values))
 
         # Get country
         country = await get_country_from_centroid(geom)
@@ -1058,16 +974,21 @@ async def generate_context(
             "dem": dem,
             "ndvi": ndvi_stats,
             "landcover": landcover,
-            "soils": soil_result,
-            "population": pop_result,
-            "climate": climate_result,
-            "hydrology": hydro_result,
+            "soils": extra_results.get("soils"),
+            "population": extra_results.get("population"),
+            "climate": extra_results.get("climate"),
+            "hydrology": extra_results.get("hydrology"),
             "country": country,
             "admin_level1": "",  # TODO: fetch from OSM
             "admin_level2": "",  # TODO: fetch from OSM
             "regulatory_framework": regulatory_framework or "",
             "scene_dates": scene_dates,
             "scene_ids": scene_ids,
+            "analysis": {
+                "bbox_area_km2": round(aoi["bbox_area_km2"], 2),
+                "datasets": sorted(requested),
+                "mode": "synchronous",
+            },
         }
 
         result = {"summary": summary}
@@ -1094,54 +1015,6 @@ async def generate_context(
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)[:150]}")
 
 # --------------------------------------------------
-# FALLBACK: MODIS NDVI
-# --------------------------------------------------
-async def compute_modis_ndvi_fallback(bbox: list) -> dict | None:
-    try:
-        catalog = pystac_client.Client.open(
-            STAC_URL,
-            modifier=planetary_computer.sign_inplace,
-        )
-        
-        year = datetime.date.today().year - 1
-        months = ["01", "04", "07", "10"]
-        ndvi_vals = []
-
-        for m in months:
-            search = catalog.search(
-                collections=["modis-13A1-061"],
-                bbox=bbox,
-                datetime=f"{year}-{m}",
-            )
-            try:
-                item = next(search.items())
-                href = planetary_computer.sign(
-                    item.assets["500m_16_days_NDVI"].href
-                )
-                with rio.open(href) as src:
-                    arr = src.read(1).astype(float)
-                    arr[arr <= -2000] = np.nan
-                    ndvi_vals.append(arr * 0.0001)
-            except StopIteration:
-                continue
-
-        if not ndvi_vals:
-            return None
-
-        return {
-            "mean": float(np.nanmean(ndvi_vals)),
-            "min": float(np.nanmin(ndvi_vals)),
-            "max": float(np.nanmax(ndvi_vals)),
-            "std": float(np.nanstd(ndvi_vals)),
-            "method": "modis_fallback",
-            "resolution_m": 500,
-            "warning": "Coarse resolution (500m) - use smaller areas for better accuracy",
-        }
-    except Exception as e:
-        print(f"MODIS fallback error: {type(e).__name__} - {str(e)[:150]}", file=sys.stderr)
-        return None
-
-# --------------------------------------------------
 # HEALTH CHECK
 # --------------------------------------------------
 @app.get("/health")
@@ -1149,15 +1022,23 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "GeoContext Generator API",
-        "timestamp": datetime.datetime.utcnow().isoformat(),
-        "version": "1.1.0-optimized"
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
+        "version": "1.2.0"
     }
 
 @app.get("/version")
 async def get_version():
     return {
-        "version": "1.1.0",
-        "optimizations": ["clip_before_median", "timeout_guardrails", "graceful_degradation"],
-        "max_area_km2": 10.0,
-        "ndvi_resolution_m": 20
+        "version": "1.2.0",
+        "optimizations": [
+            "validated_multipolygon_aoi",
+            "bounded_planetary_computer_search",
+            "clip_before_ndvi_reduction",
+            "synchronous_capacity_guardrails",
+        ],
+        "max_sync_bbox_km2": MAX_SYNC_BBOX_KM2,
+        "max_ndvi_bbox_km2": MAX_NDVI_BBOX_KM2,
+        "max_pc_scenes": MAX_PC_SCENES,
+        "ndvi_resolution_m": 20,
+        "large_area_mode": "not available until a durable asynchronous worker is deployed",
     }

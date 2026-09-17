@@ -1,93 +1,60 @@
-# Deployment Guide: GeoContextualize
+# Deployment guide
 
-This guide explains how to deploy the GeoContextualize full-stack application to a remote server using Docker.
+The production stack is intentionally small: a FastAPI backend and a Next.js
+frontend run on loopback-only Docker ports, while Nginx is the only public
+entry point. Browser calls use the same-origin `/api` path.
 
-## 1. Prerequisites
+## Prerequisites
 
-Ensure your remote server has:
-- **Ubuntu 22.04 LTS** (recommended)
-- **Git**
-- **Docker** & **Docker Compose**
+- Ubuntu with Docker Compose v2, Git, and Nginx
+- A real `.env` file containing `GEMINI_API_KEY`; copy `.env.example`, do not
+  commit the resulting file
+- A public HTTPS hostname is preferred. The checked-in Nginx examples also
+  support the current server IP as a short-lived certificate fallback.
 
-### Install Docker & Docker Compose
-If not already installed, run:
+## Deploy the `main` source
+
 ```bash
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-sudo usermod -aG docker $USER
-# Log out and log back in for group changes to take effect
-```
-
-## 2. Server Setup
-
-### Clone the Repository
-```bash
-git clone https://github.com/eugene-tulu/DescribeyourArea.git geocontextualize
-cd geocontextualize
-```
-
-### Configure Environment Variables
-Create a `.env` file in the root directory:
-```bash
-nano .env
-```
-Add your API keys:
-```env
-GEMINI_API_KEY=your_google_gemini_api_key_here
-# This value is embedded into the Next.js frontend at image-build time.
-# Use the public HTTPS API URL once a reverse proxy is configured.
-NEXT_PUBLIC_BACKEND_URL=http://<your-server-ip>:8001
-```
-
-## 3. Deploying with Docker Compose
-
-Run the application in detached mode:
-```bash
+git clone --branch main https://github.com/eugene-tulu/DescribeyourArea.git /srv/geocontextualize
+cd /srv/geocontextualize
+cp .env.example .env
+# Set GEMINI_API_KEY and, if needed, the explicit CORS_ORIGINS.
 docker compose up -d --build
-```
-
-### Verify Status
-Check if containers are running:
-```bash
 docker compose ps
-```
-Check logs for the backend:
-```bash
-docker compose logs -f backend
+curl --fail http://127.0.0.1:8001/health
 ```
 
-## 4. Accessing the Application
+The Compose file deliberately binds only `127.0.0.1:3000` and
+`127.0.0.1:8001`. It also caps application resources, retains only small local
+logs, and has no disk-growing STAC cache.
 
-- **Frontend:** `http://<your-server-ip>:3000`
-- **Backend API:** `http://<your-server-ip>:8001`
-- **Health Check:** `http://<your-server-ip>:8001/health`
+## Nginx
 
-If `NEXT_PUBLIC_BACKEND_URL` changes, rebuild the frontend image so the new value is included in the browser bundle:
+Install `deploy/nginx/geocontextualize-rate-limit.conf` under
+`/etc/nginx/conf.d/`. Use `geocontextualize-http.conf` while issuing a
+certificate, then replace it with `geocontextualize-ip.conf` (or an equivalent
+named-host configuration). Test every change before reloading:
+
 ```bash
-docker compose up -d --build frontend
+nginx -t && systemctl reload nginx
 ```
 
-## 5. Production Considerations
+The proxy strips the `/api/` prefix before forwarding to FastAPI, applies
+per-IP request and connection limits, and keeps Docker service ports private.
 
-### Reverse Proxy (Nginx)
-For production, use **Nginx** or Caddy as a reverse proxy to handle HTTPS and route traffic to the frontend and backend. Set `NEXT_PUBLIC_BACKEND_URL` to the public HTTPS backend URL before rebuilding the frontend, then do not expose ports 3000 or 8001 publicly.
+## Verify and maintain
 
-### Security
-- **Firewall:** Open only ports 80, 443, and 22 (SSH). Close 3000 and 8001 to the public after the reverse proxy is in place.
-- **Env Vars:** Never commit your `.env` file to Git.
-
-### Data Persistence
-The backend uses a `.cache` volume to store scene metadata and avoid redundant STAC searches. This is persisted via the Docker volume defined in `docker-compose.yml`.
-
-## 6. Maintenance
-
-### Updating the App
 ```bash
-git pull
+curl --fail https://209.38.197.161/api/health
+docker compose logs --tail=100 backend
 docker compose up -d --build
 ```
 
-### Stopping the App
-```bash
-docker compose down
-```
+The API admits only polygonal GeoJSON. Defaults are a 500 KB payload, 10,000
+vertices, a 100 km² synchronous bounding-box cap, and a 10 km² NDVI cap. The
+application returns an explicit skipped NDVI result above that smaller cap;
+large asynchronous analyses require a separately deployed durable queue and
+worker.
+
+Open only SSH, HTTP, and HTTPS in the firewall after confirming the Nginx
+route. Do not expose ports 3000 or 8001 publicly.
