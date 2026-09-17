@@ -6,17 +6,15 @@ A geospatial analysis API that generates contextual information about any locati
 
 - Elevation analysis using NASADEM
 - Landcover classification using ESA WorldCover
-- NDVI (Normalized Difference Vegetation Index) analysis using Sentinel-2 data
+- Bounded NDVI (Normalized Difference Vegetation Index) analysis using Sentinel-2 data
 - AI-powered narrative descriptions using Google Gemini
-- Support for custom GeoJSON areas
-- Render and Railway deployment ready
+- Support for Polygon, MultiPolygon, and polygon FeatureCollection study areas
+- Docker deployment behind a same-origin HTTPS reverse proxy
 
 ## Deployment
 
-The API is deployed on both Render and Railway:
-
-- **Railway**: https://describeyourarea-production.up.railway.app
-- **Render**: (URL to be added)
+See [DEPLOYMENT.md](DEPLOYMENT.md). Production Docker ports are loopback-only;
+Nginx serves the frontend and routes `/api/` to the backend.
 
 ## Backend (API)
 
@@ -26,7 +24,7 @@ Built with FastAPI, the backend provides:
 - `/health` - Health check endpoint
 - `/version` - Version information endpoint
 - CORS support for web applications
-- Memory and timeout constraints for free-tier hosting
+- Request-size, vertex, bounding-box, concurrency, memory, and timeout limits
 
 ## Frontend
 
@@ -83,9 +81,10 @@ The frontend is a Next.js application located in the `client/` directory that pr
    ```bash
    npm install
    ```
-3. Set environment variable to use the deployed backend:
+3. The local default routes through `/api`; Next.js proxies that route to
+   `http://127.0.0.1:8000` during development. To use another backend, set:
    ```bash
-   export NEXT_PUBLIC_BACKEND_URL=https://describeyourarea-production.up.railway.app
+   export NEXT_PUBLIC_BACKEND_URL=https://your-api.example.org
    ```
 4. Run the development server:
    ```bash
@@ -112,12 +111,19 @@ The system leverages Microsoft Planetary Computer to access:
 - NASADEM for elevation data
 - ESA WorldCover for landcover classification
 - Sentinel-2 L2A for NDVI analysis
-- MODIS as fallback for NDVI when needed
+- no whole-raster fallback; unavailable or oversized NDVI requests return an explicit status
 
 ## Constraints
 
-The system includes several constraints for reliable operation on free-tier hosting:
-- Maximum area size of 10 km² for NDVI analysis
-- Timeout protection with 15-second limits
-- Memory-safe processing with chunked operations
-- Fallback mechanisms when constraints are exceeded
+The live synchronous service is deliberately bounded:
+
+- Polygon and MultiPolygon inputs are validated and FeatureCollections are unioned.
+- A request is rejected when its bounding box exceeds 100 km² by default.
+- NDVI is skipped (with an explicit warning) when its bounding box exceeds 10 km².
+- Sentinel-2 searches retrieve at most four cloud-filtered scenes and retry only
+  short transient catalogue errors.
+- One analysis is admitted at a time by default to protect the server and shared
+  Planetary Computer resources.
+
+Large-area or batch analyses need a durable asynchronous job system before they
+should be accepted.

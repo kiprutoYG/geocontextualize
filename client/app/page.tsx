@@ -2,7 +2,7 @@
 
 import { useState, useRef } from 'react';
 import dynamic from 'next/dynamic';
-import { Search, MapPin, Loader2, Globe, Satellite, Download } from 'lucide-react';
+import { Search, MapPin, Loader2, Globe, Satellite } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -10,7 +10,6 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Label } from '@/components/ui/label';
-import { Badge } from '@/components/ui/badge';
 import { Feature, FeatureCollection, Geometry } from "geojson";
 import CopySummary from '@/components/Copy';
 import { useToast } from '@/hooks/use-toast';
@@ -109,22 +108,40 @@ export default function Home() {
     setSearchResults([]);
   };
 
-  // Handle bounding box creation from map
-  const handleBoundingBoxCreated = (bbox: BoundingBox) => {
+  // Keep bounds only as a fallback. Analyses use the full drawn polygon.
+  const handleBoundingBoxCreated = (bbox: BoundingBox | null) => {
     setBoundingBox(bbox);
+  };
+
+  const handleDrawnFeatures = (features: FeatureCollection<Geometry>) => {
+    setDrawnFeatures(features);
+    if (features.features.length > 0) {
+      // A new drawing is the user's most recent study area, so do not send an
+      // older upload instead.
+      setUploadedGeojson(null);
+    }
   };
 
   // Handle file upload
   const handleGeojsonUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (file.size > 500_000) {
+      toast({
+        title: "GeoJSON is too large",
+        description: "Uploads are limited to 500 KB for the synchronous analysis service.",
+        variant: "destructive",
+      });
+      e.target.value = "";
+      return;
+    }
 
     const reader = new FileReader();
     reader.onload = (event) => {
       try {
         const parsed = JSON.parse(event.target?.result as string);
         setUploadedGeojson(parsed);
-        // boundingBox auto-updated in MapComponent
+        setDrawnFeatures(null);
         toast({
           title: "Success",
           description: "GeoJSON file uploaded successfully.",
@@ -142,12 +159,13 @@ export default function Home() {
   };
   //summarize data function
   interface DemStats {
-  mean: number;
-  min: number;
-  max: number;
-  std: number;
+  mean?: number;
+  min?: number;
+  max?: number;
+  std?: number;
   elevation_range_m?: number;
   terrain_type?: string;
+  error?: string;
   }
 
   // interface TemperatureStats {
@@ -158,20 +176,25 @@ export default function Home() {
   // }
 
   interface NdviStats {
-  mean: number;
-  min: number;
-  max: number;
-  std: number;
+  mean?: number;
+  min?: number;
+  max?: number;
+  std?: number;
   p25?: number;
   p75?: number;
   scene_count?: number;
   resolution_m?: number;
   method?: string;
   warning?: string;
+  status?: string;
   }
 
   interface LandcoverStats {
-    [code: string]: number; // e.g. { "10": 23.71, "20": 36.9 }
+    classes?: Record<string, number>;
+    dominant_class?: string;
+    dominant_percentage?: number;
+    error?: string;
+    [code: string]: number | string | Record<string, number> | undefined;
   }
 
   interface Summary {
@@ -193,13 +216,15 @@ export default function Home() {
   const lines: string[] = [];
 
   // 1. Elevation context
-  if (dem) {
+  if (dem?.mean != null && dem.min != null && dem.max != null && dem.std != null) {
     lines.push(
       `Elevation: averages around ${dem.mean.toFixed(0)} m (range: ${dem.min}–${dem.max} m, Standard deviation of ${dem.std.toFixed(1)}).`
     );
     if (dem.terrain_type) {
       lines.push(`Terrain: ${dem.terrain_type}.`);
     }
+  } else if (dem?.error) {
+    lines.push(`Elevation: ${dem.error}.`);
   }
 
   // // 2. Temperature context
@@ -217,9 +242,9 @@ export default function Home() {
     if (ndvi.method) {
       lines.push(`NDVI method: ${ndvi.method}.`);
     }
-    if (ndvi.warning) {
-      lines.push(`Note: ${ndvi.warning}.`);
-    }
+  }
+  if (ndvi?.warning) {
+    lines.push(`NDVI: ${ndvi.warning}`);
   }
 
   // 4. Landcover breakdown
@@ -252,12 +277,15 @@ export default function Home() {
       if (parts.length > 0) {
         lines.push(`Land cover composition: ${parts.join(", ")}.`);
       }
+    } else if (landcover.error) {
+      lines.push(`Land cover: ${landcover.error}.`);
     } else {
       // Handle old structure: direct code-percentage mapping
       const parts: string[] = [];
       for (const [code, pct] of Object.entries(landcover)) {
+        if (typeof pct !== "number") continue;
         const label = classMap[code] || `Class ${code}`;
-        parts.push(`${label} (${(+pct).toFixed(2)}%)`);
+        parts.push(`${label} (${pct.toFixed(2)}%)`);
       }
       if (parts.length > 0) {
         lines.push(`Land cover composition: ${parts.join(", ")}.`);
@@ -265,22 +293,25 @@ export default function Home() {
     }
   }
 
-  return lines.join(" ");
+  return lines.join(" ") || "No requested datasets returned a usable result.";
 }
 
 
   // Send request to backend
   const handleAnalyze = async () => {
-    if ( !uploadedGeojson && !boundingBox) return;
+    if (!uploadedGeojson && !drawnFeatures?.features.length && !boundingBox) return;
 
     setIsLoading(true);
     setResponse('');
 
     try {
-      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+      const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || '/api').replace(/\/$/, '');
       let geojson;
-      // Construct GeoJSON polygon from boundingBox
-      if (uploadedGeojson) {
+      // Preserve the actual drawn geometry; use a bounding-box polygon only
+      // when no uploaded or drawn GeoJSON exists.
+      if (drawnFeatures?.features.length) {
+        geojson = drawnFeatures;
+      } else if (uploadedGeojson) {
       // use the uploaded file directly
       geojson = uploadedGeojson;
       } else if (boundingBox) {
@@ -314,7 +345,10 @@ export default function Home() {
         body: JSON.stringify({ geojson }),
       });
 
-      if (!response.ok) throw new Error(`HTTP error! ${response.status}`);
+      if (!response.ok) {
+        const error = await response.json().catch(() => null);
+        throw new Error(error?.detail || `HTTP error! ${response.status}`);
+      }
 
       const data = await response.json();
       setResponse(summarizeData(data.summary, data.narrative));
@@ -420,7 +454,7 @@ export default function Home() {
                 </div>
                 <div className="flex items-start">
                   <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">3</div>
-                  <p className="text-sm">Use the drawing tool to create a bounding box on the map</p>
+                  <p className="text-sm">Use the drawing tool to create a polygon or rectangle on the map</p>
                 </div>
                 <div className="flex items-start">
                   <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">4</div>
@@ -443,7 +477,7 @@ export default function Home() {
                             file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
                 />
                 <p className="text-xs text-slate-400 mt-2">
-                  Upload a <code>.geojson</code> file to define your study area.
+                  Upload a Polygon or MultiPolygon <code>.geojson</code> file (maximum 500 KB).
                 </p>
               </CardContent>
             </Card>
@@ -520,7 +554,7 @@ export default function Home() {
             {/* Analyze Button */}
             <Button
               onClick={handleAnalyze}
-              disabled={!boundingBox && !uploadedGeojson || isLoading}
+              disabled={(!boundingBox && !uploadedGeojson && !drawnFeatures?.features.length) || isLoading}
               className="w-full bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white py-6 text-lg font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isLoading ? (
@@ -554,7 +588,7 @@ export default function Home() {
                       selectedLocation={selectedLocation}
                       onBoundingBoxCreated={handleBoundingBoxCreated}
                       uploadedGeoJSON={uploadedGeojson}
-                      onSaveFeatures={setDrawnFeatures}
+                      onSaveFeatures={handleDrawnFeatures}
                     />
                     {drawnFeatures && drawnFeatures.features.length > 0 && (
                       <button
@@ -595,7 +629,7 @@ export default function Home() {
                     )}
                     {selectedDatasets.includes('ndvi') && (
                       <li>
-                        <strong>Vegetation (NDVI):</strong> Sentinel-2 imagery median composite of the most recent 8 cloud-filtered scenes (reduces noise from clouds and outliers)
+                        <strong>Vegetation (NDVI):</strong> bounded Sentinel-2 median composite of up to 4 recent cloud-filtered scenes; requests above the 10 km² NDVI limit are reported as skipped
                       </li>
                     )}
                   </ul>

@@ -2,31 +2,53 @@ services:
   backend:
     build: .
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     env_file:
       - .env
     environment:
-      - PORT=8000
-    volumes:
-      - .cache:/app/.cache
+      PORT: "8000"
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://209.38.197.161}
+      MAX_SYNC_BBOX_KM2: ${MAX_SYNC_BBOX_KM2:-100}
+      MAX_NDVI_BBOX_KM2: ${MAX_NDVI_BBOX_KM2:-10}
+      MAX_CONCURRENT_ANALYSES: ${MAX_CONCURRENT_ANALYSES:-1}
+      MAX_PC_SCENES: ${MAX_PC_SCENES:-4}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 30s
+      interval: 20s
       timeout: 5s
-      retries: 3
-    restart: always
+      retries: 5
+      start_period: 20s
+    mem_limit: 1800m
+    cpus: 1.25
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: on-failure:5
 
   frontend:
     build:
       context: ./client
       args:
-        NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://127.0.0.1:8001}
+        NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-/api}
+        BACKEND_PROXY_TARGET: http://backend:8000
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       backend:
         condition: service_healthy
-    restart: always
-
-volumes:
-  .cache:
+    mem_limit: 384m
+    cpus: 0.5
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped

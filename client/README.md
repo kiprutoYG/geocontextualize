@@ -4,11 +4,14 @@ This is the frontend for the GeoContext Generator API, built with Next.js.
 
 ## Configuration
 
-To connect the frontend to the deployed backend, set the following environment variable:
+The production frontend uses a same-origin API path:
 
 ```bash
-NEXT_PUBLIC_BACKEND_URL=https://describeyourarea-production.up.railway.app
+NEXT_PUBLIC_BACKEND_URL=/api
 ```
+
+Nginx routes `/api/` to the private backend service. This avoids embedding a
+public server address in the browser bundle.
 
 ### Development
 
@@ -22,24 +25,16 @@ npm install
 npm run dev
 ```
 
-The frontend will automatically connect to `http://127.0.0.1:8000` by default when no `NEXT_PUBLIC_BACKEND_URL` is set.
+The frontend calls `/api` by default. Next.js rewrites that path to
+`http://127.0.0.1:8000` during local development. Docker builds pass
+`BACKEND_PROXY_TARGET=http://backend:8000` so the same path works in Compose.
 
 ### Production
 
-To run with the deployed Railway backend:
+Build the standalone frontend image behind the reverse proxy:
 
 ```bash
-# Set the environment variable
-export NEXT_PUBLIC_BACKEND_URL=https://describeyourarea-production.up.railway.app
-
-# Install dependencies
-npm install
-
-# Build the application
-npm run build
-
-# Start the production server
-npm start
+docker compose up -d --build frontend
 ```
 
 ## Features
@@ -54,4 +49,5 @@ npm start
 
 ## Deployment
 
-The frontend can be deployed to Vercel, Netlify, or any platform that supports Next.js applications.
+For the server deployment, keep port 3000 loopback-only and serve it through
+the HTTPS reverse proxy described in the repository deployment guide.
