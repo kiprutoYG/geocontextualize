@@ -1,13 +1,40 @@
-.git
-.gitignore
-.env
-.env.*
+# ----------------------
+# Python cache & builds
+# ----------------------
 __pycache__/
-*.py[cod]
-.cache/
+*.pyc
+*.pyo
+*.pyd
 .pytest_cache/
-*.log
-.DS_Store
-.vscode/
+.mypy_cache/
+
+# ----------------------
+# Virtual environments
+# ----------------------
 venv/
+.env
+*.env
+.cache/
+
+# ----------------------
+# Frontend (ignore client folder)
+# ----------------------
 client/
+
+# ----------------------
+# Docker & build artifacts
+# ----------------------
+Dockerfile
+docker-compose.yml
+*.log
+.git/
+.github/
+.agents/
+.codex/
+benchmark_*.json
+
+# ----------------------
+# OS / editor files
+# ----------------------
+.DS_Store
+Thumbs.db

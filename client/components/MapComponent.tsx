@@ -69,27 +69,6 @@ function MapController({
     return geojsonData;
   }, []);
 
-  const saveCurrentFeatures = useCallback(() => {
-    if (!drawnItemsRef.current) return;
-
-    const geojsonData = convertToGeoJSON();
-    if (geojsonData && onSaveFeatures) {
-      onSaveFeatures(geojsonData);
-    }
-
-    const bounds = drawnItemsRef.current.getBounds();
-    if (bounds.isValid()) {
-      onBoundingBoxCreated({
-        north: bounds.getNorth(),
-        south: bounds.getSouth(),
-        east: bounds.getEast(),
-        west: bounds.getWest(),
-      });
-    } else {
-      onBoundingBoxCreated(null);
-    }
-  }, [convertToGeoJSON, onBoundingBoxCreated, onSaveFeatures]);
-
   // Memoize event handlers to prevent recreation on every render
   const handleCreated = useCallback((e: L.LeafletEvent) => {
     if (!drawnItemsRef.current) return;
@@ -100,16 +79,42 @@ function MapController({
     drawnItemsRef.current.clearLayers();
     drawnItemsRef.current.addLayer(layer);
 
-    saveCurrentFeatures();
-  }, [saveCurrentFeatures]);
+    const bounds = layer.getBounds();
+    const bbox: BoundingBox = {
+      north: bounds.getNorth(),
+      south: bounds.getSouth(),
+      east: bounds.getEast(),
+      west: bounds.getWest(),
+    };
+    onBoundingBoxCreated(bbox);
+    
+    if (onSaveFeatures) {
+      const geojsonData = convertToGeoJSON();
+      if (geojsonData) {
+        onSaveFeatures(geojsonData);
+      }
+    }
+  }, [onBoundingBoxCreated, onSaveFeatures, convertToGeoJSON]);
 
   const handleDeleted = useCallback(() => {
-    saveCurrentFeatures();
-  }, [saveCurrentFeatures]);
+    onBoundingBoxCreated(null);
+    
+    if (onSaveFeatures) {
+      const geojsonData = convertToGeoJSON();
+      if (geojsonData) {
+        onSaveFeatures(geojsonData);
+      }
+    }
+  }, [onBoundingBoxCreated, onSaveFeatures, convertToGeoJSON]);
 
   const handleEdited = useCallback(() => {
-    saveCurrentFeatures();
-  }, [saveCurrentFeatures]);
+    if (onSaveFeatures) {
+      const geojsonData = convertToGeoJSON();
+      if (geojsonData) {
+        onSaveFeatures(geojsonData);
+      }
+    }
+  }, [onSaveFeatures, convertToGeoJSON]);
 
   useEffect(() => {
     if (selectedLocation) {
@@ -140,6 +145,8 @@ function MapController({
       const drawControl = new L.Control.Draw({
         position: "topright",
         draw: {
+          // Lines and circles serialize to unsupported GeoJSON geometries for
+          // area analysis, so only offer geometry types the API can analyze.
           polyline: false,
           polygon: {
             shapeOptions: {

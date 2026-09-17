@@ -48,7 +48,7 @@ interface AnalysisWarning {
   status?: string;
 }
 
-type DatasetId = 'dem' | 'landcover' | 'ndvi';
+type DatasetId = 'dem' | 'landcover' | 'ndvi' | 'soils' | 'population' | 'climate' | 'hydrology';
 
 const DATASET_OPTIONS: Array<{
   id: DatasetId;
@@ -58,6 +58,10 @@ const DATASET_OPTIONS: Array<{
   { id: 'dem', label: 'Elevation & terrain', description: 'Elevation range and terrain variation' },
   { id: 'landcover', label: 'Land cover', description: 'ESA WorldCover composition' },
   { id: 'ndvi', label: 'Vegetation (NDVI)', description: 'Recent Sentinel-2 vegetation condition' },
+  { id: 'soils', label: 'Soil organic carbon', description: 'Soil carbon estimate' },
+  { id: 'population', label: 'Population', description: 'Population and density estimate' },
+  { id: 'climate', label: 'Climate normals', description: 'Temperature and precipitation baseline' },
+  { id: 'hydrology', label: 'Hydrology', description: 'Mapped water and waterways' },
 ];
 
 const LANDCOVER_LABELS: Record<string, string> = {
@@ -104,21 +108,59 @@ interface LandcoverStats {
   dominant_class?: string;
   dominant_percentage?: number;
   error?: string;
-  source?: string;
   [key: string]: unknown;
 }
 
-interface AnalysisArea {
-  geometry_km2?: number;
-  bounding_box_km2?: number;
-  synchronous_bounding_box_limit_km2?: number;
+interface SoilStats {
+  mean_soc_tC_ha?: number;
+  units?: string;
+  source?: string;
+  collection?: string;
+  date?: string;
+}
+
+interface PopulationStats {
+  total_pop?: number;
+  density_per_km2?: number | null;
+  year?: number | null;
+  source?: string;
+  collection?: string;
+}
+
+interface ClimateStats {
+  mean_temp_c?: number;
+  annual_precip_mm?: number;
+  period?: string;
+  source?: string;
+}
+
+interface HydrologyStats {
+  water_area_km2?: number;
+  water_cover_pct?: number;
+  waterway_length_km?: number;
+  source?: string;
+}
+
+interface AnalysisMetadata {
+  bbox_area_km2?: number;
+  datasets?: string[];
+  mode?: string;
 }
 
 interface Summary {
   dem?: DemStats | null;
   ndvi?: NdviStats | null;
   landcover?: LandcoverStats | null;
-  analysis_area?: AnalysisArea;
+  soils?: SoilStats | null;
+  population?: PopulationStats | null;
+  climate?: ClimateStats | null;
+  hydrology?: HydrologyStats | null;
+  country?: string | null;
+  analysis?: AnalysisMetadata;
+}
+
+function isDatasetId(value: string): value is DatasetId {
+  return DATASET_OPTIONS.some((dataset) => dataset.id === value);
 }
 
 function formatNumber(value: number | null | undefined, maximumFractionDigits = 1): string {
@@ -157,7 +199,9 @@ function ResultCard({
         <h3 className="font-semibold text-white">{title}</h3>
         <p className="text-xs text-slate-400">{description}</p>
       </div>
-      {unavailable ? <p className="text-sm text-slate-300">{unavailable}</p> : children}
+      {unavailable ? (
+        <p className="text-sm text-slate-300">{unavailable}</p>
+      ) : children}
     </section>
   );
 }
@@ -218,26 +262,92 @@ function DatasetResultCard({ dataset, summary }: { dataset: DatasetId; summary: 
             </div>
           ))}
         </dl>
-        {landcover.source && <p className="mt-3 text-xs text-slate-400">Source: {landcover.source}</p>}
       </ResultCard>
     );
   }
 
-  const ndvi = summary.ndvi;
-  if (!ndvi || ndvi.status === 'skipped' || ndvi.status === 'unavailable' || ndvi.mean == null) {
-    return <ResultCard title={option.label} description={option.description} unavailable={ndvi?.warning || 'No recent NDVI result was returned for this area.'} />;
+  if (dataset === 'ndvi') {
+    const ndvi = summary.ndvi;
+    if (!ndvi || ndvi.status === 'skipped' || ndvi.status === 'unavailable') {
+      return <ResultCard title={option.label} description={option.description} unavailable={ndvi?.warning || 'No recent NDVI result was returned for this area.'} />;
+    }
+    return (
+      <ResultCard title={option.label} description={option.description}>
+        <dl className="grid grid-cols-2 gap-2">
+          <Metric label="Median composite mean" value={formatNumber(ndvi.mean, 2)} />
+          <Metric label="Middle 50%" value={`${formatNumber(ndvi.p25, 2)}–${formatNumber(ndvi.p75, 2)}`} />
+          <Metric label="Value range" value={`${formatNumber(ndvi.min, 2)}–${formatNumber(ndvi.max, 2)}`} />
+          <Metric label="Scenes used" value={formatNumber(ndvi.scene_count, 0)} />
+        </dl>
+        <p className="mt-3 text-xs text-slate-400">
+          {ndvi.source || 'Sentinel-2'}{ndvi.resolution_m ? ` · ${ndvi.resolution_m} m` : ''}
+        </p>
+      </ResultCard>
+    );
+  }
+
+  if (dataset === 'soils') {
+    const soils = summary.soils;
+    if (!soils) {
+      return <ResultCard title={option.label} description={option.description} unavailable="No soil-carbon data was returned for this area." />;
+    }
+    return (
+      <ResultCard title={option.label} description={option.description}>
+        <dl className="grid grid-cols-2 gap-2">
+          <Metric label="Mean soil organic carbon" value={`${formatNumber(soils.mean_soc_tC_ha, 2)} ${soils.units || 'tC/ha'}`} />
+          <Metric label="Dataset date" value={soils.date ? new Date(soils.date).toLocaleDateString() : '—'} />
+        </dl>
+        {soils.source && <p className="mt-3 text-xs text-slate-400">Source: {soils.source}</p>}
+      </ResultCard>
+    );
+  }
+
+  if (dataset === 'population') {
+    const population = summary.population;
+    if (!population) {
+      return <ResultCard title={option.label} description={option.description} unavailable="No population data was returned for this area." />;
+    }
+    return (
+      <ResultCard title={option.label} description={option.description}>
+        <dl className="grid grid-cols-2 gap-2">
+          <Metric label="Estimated population" value={formatNumber(population.total_pop, 0)} />
+          <Metric label="Density" value={population.density_per_km2 == null ? '—' : `${formatNumber(population.density_per_km2, 1)} / km²`} />
+          <Metric label="Reference year" value={population.year?.toString() || '—'} />
+        </dl>
+        {population.source && <p className="mt-3 text-xs text-slate-400">Source: {population.source}</p>}
+      </ResultCard>
+    );
+  }
+
+  if (dataset === 'climate') {
+    const climate = summary.climate;
+    if (!climate) {
+      return <ResultCard title={option.label} description={option.description} unavailable="No climate-normal data was returned for this area." />;
+    }
+    return (
+      <ResultCard title={option.label} description={option.description}>
+        <dl className="grid grid-cols-2 gap-2">
+          <Metric label="Mean temperature" value={`${formatNumber(climate.mean_temp_c, 1)} °C`} />
+          <Metric label="Annual precipitation" value={`${formatNumber(climate.annual_precip_mm, 0)} mm`} />
+          <Metric label="Reference period" value={climate.period || '—'} />
+        </dl>
+        {climate.source && <p className="mt-3 text-xs text-slate-400">Source: {climate.source}</p>}
+      </ResultCard>
+    );
+  }
+
+  const hydrology = summary.hydrology;
+  if (!hydrology) {
+    return <ResultCard title={option.label} description={option.description} unavailable="No mapped hydrology data was returned for this area." />;
   }
   return (
     <ResultCard title={option.label} description={option.description}>
       <dl className="grid grid-cols-2 gap-2">
-        <Metric label="Median composite mean" value={formatNumber(ndvi.mean, 2)} />
-        <Metric label="Middle 50%" value={`${formatNumber(ndvi.p25, 2)}–${formatNumber(ndvi.p75, 2)}`} />
-        <Metric label="Value range" value={`${formatNumber(ndvi.min, 2)}–${formatNumber(ndvi.max, 2)}`} />
-        <Metric label="Scenes used" value={formatNumber(ndvi.scene_count, 0)} />
+        <Metric label="Mapped water area" value={`${formatNumber(hydrology.water_area_km2, 3)} km²`} />
+        <Metric label="Water cover" value={`${formatNumber(hydrology.water_cover_pct, 1)}%`} />
+        <Metric label="Waterway length" value={`${formatNumber(hydrology.waterway_length_km, 1)} km`} />
       </dl>
-      <p className="mt-3 text-xs text-slate-400">
-        {ndvi.source || 'Sentinel-2'}{ndvi.resolution_m ? ` · ${ndvi.resolution_m} m` : ''}
-      </p>
+      {hydrology.source && <p className="mt-3 text-xs text-slate-400">Source: {hydrology.source}</p>}
     </ResultCard>
   );
 }
@@ -309,31 +419,23 @@ export default function Home() {
     setSearchResults([]);
   };
 
-  // Keep bounds only as a fallback. Analyses use the full drawn polygon.
+  // Handle bounding box creation from map
   const handleBoundingBoxCreated = (bbox: BoundingBox | null) => {
     setBoundingBox(bbox);
-  };
-
-  const handleDrawnFeatures = (features: FeatureCollection<Geometry>) => {
-    setDrawnFeatures(features);
-    if (features.features.length > 0) {
-      // A new drawing is the user's most recent study area, so do not send an
-      // older upload instead.
-      setUploadedGeojson(null);
-    }
   };
 
   // Handle file upload
   const handleGeojsonUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
     if (file.size > 500_000) {
       toast({
-        title: "GeoJSON is too large",
-        description: "Uploads are limited to 500 KB for the synchronous analysis service.",
+        title: "File is too large",
+        description: "GeoJSON uploads are limited to 500 KB. Simplify the geometry and try again.",
         variant: "destructive",
       });
-      e.target.value = "";
+      e.target.value = '';
       return;
     }
 
@@ -345,7 +447,6 @@ export default function Home() {
           throw new Error('The file is not a GeoJSON object.');
         }
         setUploadedGeojson(parsed as GeoJsonObject);
-        setDrawnFeatures(null);
         toast({
           title: "Success",
           description: "GeoJSON file uploaded successfully.",
@@ -370,11 +471,11 @@ export default function Home() {
 
   const lines: string[] = [];
 
-  if (summary.analysis_area?.geometry_km2 != null) {
-    lines.push(`Study area: ${formatNumber(summary.analysis_area.geometry_km2, 2)} km².`);
+  if (summary.country) {
+    lines.push(`Location context: ${summary.country}.`);
   }
-  if (summary.analysis_area?.bounding_box_km2 != null) {
-    lines.push(`Analysis bounding box: ${formatNumber(summary.analysis_area.bounding_box_km2, 2)} km².`);
+  if (summary.analysis?.bbox_area_km2 != null) {
+    lines.push(`Analysis bounding box: ${formatNumber(summary.analysis.bbox_area_km2, 2)} km².`);
   }
 
   const dem = summary.dem;
@@ -385,7 +486,7 @@ export default function Home() {
     if (dem.terrain_type) {
       lines.push(`Terrain: ${dem.terrain_type}.`);
     }
-  } else if (dem?.error) lines.push(`Elevation: ${dem.error}.`);
+  }
 
   const ndvi = summary.ndvi;
   if (ndvi?.mean != null) {
@@ -405,11 +506,26 @@ export default function Home() {
     const parts = landcoverEntries(landcover)
       .map(([code, percentage]) => `${LANDCOVER_LABELS[code] || code} (${formatNumber(percentage, 1)}%)`);
     if (parts.length > 0) lines.push(`Land cover: ${parts.join(', ')}.`);
-  } else if (landcover?.error) {
-    lines.push(`Land cover: ${landcover.error}.`);
   }
 
-  return lines.join(' ') || 'No requested datasets returned a usable result.';
+  if (summary.soils?.mean_soc_tC_ha != null) {
+    lines.push(`Soil organic carbon: ${formatNumber(summary.soils.mean_soc_tC_ha, 2)} ${summary.soils.units || 'tC/ha'}.`);
+  }
+  if (summary.population?.total_pop != null) {
+    lines.push(`Estimated population: ${formatNumber(summary.population.total_pop, 0)}.`);
+  }
+  if (summary.climate?.mean_temp_c != null || summary.climate?.annual_precip_mm != null) {
+    lines.push(
+      `Climate normals: ${formatNumber(summary.climate.mean_temp_c, 1)} °C mean temperature and ${formatNumber(summary.climate.annual_precip_mm, 0)} mm annual precipitation.`,
+    );
+  }
+  if (summary.hydrology?.water_area_km2 != null || summary.hydrology?.waterway_length_km != null) {
+    lines.push(
+      `Hydrology: ${formatNumber(summary.hydrology.water_area_km2, 3)} km² mapped water and ${formatNumber(summary.hydrology.waterway_length_km, 1)} km mapped waterways.`,
+    );
+  }
+
+  return lines.join(' ') || 'The selected data sources did not return values for this area.';
 }
 
 
@@ -431,17 +547,17 @@ export default function Home() {
     setAnalysisSummary(null);
 
     try {
+      // Same-origin requests work through the reverse proxy in production and
+      // through the Next.js rewrite in local Docker development.
       const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || '/api').replace(/\/$/, '');
       let geojson: GeoJsonObject | undefined;
-      // Preserve the actual drawn geometry; use a bounding-box polygon only
-      // when no uploaded or drawn GeoJSON exists.
-      if (drawnFeatures?.features.length) {
+      // Preserve the source geometry whenever one was supplied. A bounding box
+      // is only a fallback for selections created by older map interactions.
+      if (uploadedGeojson) {
+        geojson = uploadedGeojson;
+      } else if (drawnFeatures?.features.length) {
         geojson = drawnFeatures;
-      } else if (uploadedGeojson) {
-      // use the uploaded file directly
-      geojson = uploadedGeojson;
       } else if (boundingBox) {
-        // construct from bbox
         geojson = {
           type: "Feature",
           geometry: {
@@ -474,8 +590,8 @@ export default function Home() {
       });
 
       if (!response.ok) {
-        const error = await response.json().catch(() => null);
-        throw new Error(error?.detail || `HTTP error! ${response.status}`);
+        const failure = await response.json().catch(() => null);
+        throw new Error(failure?.detail || `Analysis request failed (${response.status}).`);
       }
 
       const data = await response.json() as { summary?: Summary; narrative?: string };
@@ -508,8 +624,8 @@ export default function Home() {
             </h1>
           </div>
           <p className="text-slate-300 text-lg max-w-2xl mx-auto">
-            Instantly generate location insights for reports and analysis.
-            Select any area and get elevation, vegetation, and land cover summaries in seconds.
+            Discover geographical context and insights by selecting any area on Earth.
+            Search, draw, and analyze with advanced geospatial tools.
           </p>
         </div>
 
@@ -588,7 +704,7 @@ export default function Home() {
                 </div>
                 <div className="flex items-start">
                   <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">3</div>
-                  <p className="text-sm">Use the drawing tool to create a polygon or rectangle on the map</p>
+                  <p className="text-sm">Draw a polygon or rectangle to define the area to analyze</p>
                 </div>
                 <div className="flex items-start">
                   <div className="w-6 h-6 rounded-full bg-blue-500 text-white text-xs flex items-center justify-center mr-3 mt-0.5 flex-shrink-0">4</div>
@@ -611,7 +727,7 @@ export default function Home() {
                             file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
                 />
                 <p className="text-xs text-slate-400 mt-2">
-                  Upload a Polygon or MultiPolygon <code>.geojson</code> file (maximum 500 KB).
+                  Upload a <code>.geojson</code> file to define your study area.
                 </p>
               </CardContent>
             </Card>
@@ -679,7 +795,7 @@ export default function Home() {
                     </div>
                   </div>
                   <p className="text-xs text-slate-400 mt-2">
-                    Choose the core data sources to include in this analysis.
+                    Core datasets are selected by default. Optional sources may be unavailable for some areas.
                   </p>
                 </div>
               </CardContent>
@@ -722,7 +838,7 @@ export default function Home() {
                       selectedLocation={selectedLocation}
                       onBoundingBoxCreated={handleBoundingBoxCreated}
                       uploadedGeoJSON={uploadedGeojson}
-                      onSaveFeatures={handleDrawnFeatures}
+                      onSaveFeatures={setDrawnFeatures}
                     />
                     {drawnFeatures && drawnFeatures.features.length > 0 && (
                       <button
@@ -744,32 +860,7 @@ export default function Home() {
                 </div>
               </CardContent>
             </Card>
-            {selectedDatasets.length > 0 && (
-              <div className="mb-4">
-                <div className="bg-blue-900/30 border border-blue-500/30 rounded-lg p-4">
-                  <h3 className="text-sm font-semibold text-blue-300 mb-2">
-                    Data Sources & Methods
-                  </h3>
-                  <ul className="text-xs text-slate-300 space-y-1 leading-relaxed">
-                    {selectedDatasets.includes('landcover') && (
-                      <li>
-                        <strong>Land Cover:</strong> ESA WorldCover (10m resolution, global classification)
-                      </li>
-                    )}
-                    {selectedDatasets.includes('dem') && (
-                      <li>
-                        <strong>Elevation (DEM):</strong> NASADEM (approx. 30m resolution)
-                      </li>
-                    )}
-                    {selectedDatasets.includes('ndvi') && (
-                      <li>
-                        <strong>Vegetation (NDVI):</strong> bounded Sentinel-2 median composite of up to 4 recent cloud-filtered scenes; requests above the 10 km² NDVI limit are reported as skipped
-                      </li>
-                    )}
-                  </ul>
-                </div>
-              </div>
-            )}
+
             {/* Results */}
             <Card className="bg-white/10 backdrop-blur border-white/20">
               <CardHeader className="flex flex-row items-center justify-between">
@@ -814,17 +905,17 @@ export default function Home() {
                         <div className="mt-6 border-t border-white/10 pt-5">
                           <div className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-300">
                             <h3 className="font-semibold text-white">Selected data details</h3>
-                            {analysisSummary.analysis_area?.geometry_km2 != null && (
-                              <span>Study area: {formatNumber(analysisSummary.analysis_area.geometry_km2, 2)} km²</span>
-                            )}
-                            {analysisSummary.analysis_area?.bounding_box_km2 != null && (
-                              <span>Bounding box: {formatNumber(analysisSummary.analysis_area.bounding_box_km2, 2)} km²</span>
+                            {analysisSummary.country && <span>Country: {analysisSummary.country}</span>}
+                            {analysisSummary.analysis?.bbox_area_km2 != null && (
+                              <span>Bounding box: {formatNumber(analysisSummary.analysis.bbox_area_km2, 2)} km²</span>
                             )}
                           </div>
                           <div className="grid gap-4 md:grid-cols-2">
-                            {selectedDatasets.map((dataset) => (
-                              <DatasetResultCard key={dataset} dataset={dataset} summary={analysisSummary} />
-                            ))}
+                            {(analysisSummary.analysis?.datasets || selectedDatasets)
+                              .filter(isDatasetId)
+                              .map((dataset) => (
+                                <DatasetResultCard key={dataset} dataset={dataset} summary={analysisSummary} />
+                              ))}
                           </div>
                         </div>
                       )}

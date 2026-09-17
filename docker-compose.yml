@@ -7,14 +7,14 @@ services:
       - .env
     environment:
       PORT: "8000"
-      CORS_ORIGINS: ${CORS_ORIGINS:-https://209.38.197.161}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://209.38.197.161,http://localhost:3000}
       MAX_SYNC_BBOX_KM2: ${MAX_SYNC_BBOX_KM2:-100}
       MAX_NDVI_BBOX_KM2: ${MAX_NDVI_BBOX_KM2:-10}
       MAX_CONCURRENT_ANALYSES: ${MAX_CONCURRENT_ANALYSES:-1}
       MAX_PC_SCENES: ${MAX_PC_SCENES:-4}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 20s
+      interval: 30s
       timeout: 5s
       retries: 5
       start_period: 20s
@@ -26,7 +26,7 @@ services:
     logging:
       driver: local
       options:
-        max-size: "10m"
+        max-size: 10m
         max-file: "3"
     restart: on-failure:5
 
@@ -49,6 +49,6 @@ services:
     logging:
       driver: local
       options:
-        max-size: "10m"
+        max-size: 10m
         max-file: "3"
     restart: unless-stopped

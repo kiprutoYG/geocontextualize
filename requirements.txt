@@ -23,3 +23,7 @@ google-generativeai>=0.4.0
 
 # Environment
 python-dotenv>=1.0.0
+
+# Extra datasets (Sprint 2)
+requests>=2.31.0
+overpy>=0.6

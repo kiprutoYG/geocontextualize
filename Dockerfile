@@ -1,4 +1,4 @@
-# Use a supported lightweight Python image.
+# Python 3.12 has current security support and avoids a stale runtime image.
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -18,13 +18,12 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install dependencies
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt
 
 # Copy project files
 COPY . .
 
-# The service does not need root privileges or write access to the source tree.
+# The service has no reason to write application source or run as root.
 RUN groupadd --system app && useradd --system --gid app app \
     && chown -R app:app /app
 USER app

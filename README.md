@@ -1,129 +1,67 @@
 # GeoContextualize
 
-A geospatial analysis API that generates contextual information about any location on Earth using satellite imagery and geospatial datasets.
+GeoContextualize turns a polygonal study area into a concise geospatial
+context: terrain from NASADEM, land cover from ESA WorldCover, and a bounded
+Sentinel-2 NDVI composite from Microsoft Planetary Computer. Optional modules
+add soil, population, climate, hydrology, country context, and a Gemini
+narrative.
 
-## Features
+## Reliable-by-default analysis
 
-- Elevation analysis using NASADEM
-- Landcover classification using ESA WorldCover
-- Bounded NDVI (Normalized Difference Vegetation Index) analysis using Sentinel-2 data
-- AI-powered narrative descriptions using Google Gemini
-- Support for Polygon, MultiPolygon, and polygon FeatureCollection study areas
-- Docker deployment behind a same-origin HTTPS reverse proxy
+- Accepts GeoJSON `Polygon`, `MultiPolygon`, `Feature`, and `FeatureCollection`.
+  FeatureCollection polygons are combined rather than silently discarding all
+  but the first feature.
+- Rejects malformed, oversized, or overly complex inputs before calling an
+  external service.
+- Caps synchronous bounding boxes at 100 km² by default and NDVI at 10 km².
+- Searches at most four recent cloud-filtered Sentinel-2 scenes and clips data
+  to the submitted geometry before calculating the median.
+- Uses Planetary Computer only for NDVI. There is no EOPF or unsafe full-raster
+  MODIS fallback.
+- Limits concurrent analyses so one request cannot exhaust the server or shared
+  public data services.
 
-## Deployment
+Large study areas are not silently downgraded: NDVI returns a clear `skipped`
+status. Supporting large asynchronous analysis needs a durable job queue and
+worker, which is deliberately outside this synchronous service.
 
-See [DEPLOYMENT.md](DEPLOYMENT.md). Production Docker ports are loopback-only;
-Nginx serves the frontend and routes `/api/` to the backend.
+## Local setup
 
-## Backend (API)
+```bash
+cp .env.example .env
+# Add GEMINI_API_KEY if narrative generation is needed.
+python -m pip install -r requirements.txt
+uvicorn main:app --reload
+```
 
-Built with FastAPI, the backend provides:
+In a second terminal:
 
-- `/generate-context` - Main endpoint for generating geospatial context
-- `/health` - Health check endpoint
-- `/version` - Version information endpoint
-- CORS support for web applications
-- Request-size, vertex, bounding-box, concurrency, memory, and timeout limits
+```bash
+cd client
+npm ci
+npm run dev
+```
 
-## Frontend
+The frontend uses `/api` by default. Next.js rewrites that path to the local
+backend in development. Set `NEXT_PUBLIC_BACKEND_URL` only when intentionally
+using a different API origin.
 
-The frontend is a Next.js application located in the `client/` directory that provides:
+## API
 
-- Interactive map interface
-- GeoJSON upload capability
-- Visual feedback for analysis results
-- Responsive design
+`POST /generate-context` accepts a JSON body with `geojson` and optional query
+parameters:
 
-## Technologies Used
+- `datasets=dem,landcover,ndvi` selects which data modules run. Available
+  values are `dem`, `landcover`, `ndvi`, `soils`, `population`, `climate`, and
+  `hydrology`; omitted defaults to the three core modules.
+- `include_ndvi=false` skips NDVI even if it is selected.
+- `include_narrative=true` enables Gemini narrative generation.
+- `audience=academic|investor|farmer|policy` selects the narrative audience.
 
-### Backend
-- FastAPI
-- Rasterio
-- PySTAC Client
-- Microsoft Planetary Computer
-- ODC STAC
-- Google Generative AI
-- XArray, RioxArray
+`GET /health` reports service readiness and `GET /version` describes active
+limits.
 
-### Frontend
-- Next.js
-- React
-- Leaflet
-- Tailwind CSS
+## Production
 
-## Setup
-
-### Backend Setup
-
-1. Clone the repository
-2. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Set up environment variables:
-   ```bash
-   cp .env.example .env
-   # Edit .env to add your GEMINI_API_KEY
-   ```
-4. Run the server:
-   ```bash
-   uvicorn main:app --reload
-   ```
-
-### Frontend Setup
-
-1. Navigate to the client directory:
-   ```bash
-   cd client
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. The local default routes through `/api`; Next.js proxies that route to
-   `http://127.0.0.1:8000` during development. To use another backend, set:
-   ```bash
-   export NEXT_PUBLIC_BACKEND_URL=https://your-api.example.org
-   ```
-4. Run the development server:
-   ```bash
-   npm run dev
-   ```
-
-## API Endpoints
-
-- `POST /generate-context` - Generate geospatial context for a GeoJSON area
-- `GET /health` - Health check
-- `GET /version` - Version information
-
-## Parameters
-
-The `/generate-context` endpoint accepts:
-- `geojson`: GeoJSON object defining the area of interest
-- `include_narrative`: Boolean to include AI-generated narrative
-- `audience`: Target audience for narrative ("academic", "investor", "farmer", "policy")
-- `include_ndvi`: Boolean to include NDVI analysis
-
-## Architecture
-
-The system leverages Microsoft Planetary Computer to access:
-- NASADEM for elevation data
-- ESA WorldCover for landcover classification
-- Sentinel-2 L2A for NDVI analysis
-- no whole-raster fallback; unavailable or oversized NDVI requests return an explicit status
-
-## Constraints
-
-The live synchronous service is deliberately bounded:
-
-- Polygon and MultiPolygon inputs are validated and FeatureCollections are unioned.
-- A request is rejected when its bounding box exceeds 100 km² by default.
-- NDVI is skipped (with an explicit warning) when its bounding box exceeds 10 km².
-- Sentinel-2 searches retrieve at most four cloud-filtered scenes and retry only
-  short transient catalogue errors.
-- One analysis is admitted at a time by default to protect the server and shared
-  Planetary Computer resources.
-
-Large-area or batch analyses need a durable asynchronous job system before they
-should be accepted.
+See [DEPLOYMENT.md](DEPLOYMENT.md). The Compose configuration binds app ports
+only to loopback and expects Nginx to proxy the frontend and `/api/` route.
