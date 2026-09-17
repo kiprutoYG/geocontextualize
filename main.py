@@ -39,6 +39,7 @@ app = FastAPI(title="GeoContext Generator API")
 origins = [
     "https://geocontextualize.vercel.app",
     "http://localhost:3000",
+    "http://209.38.197.161:3000",
 ]
 origins = [origin.strip() for origin in origins if origin.strip()]
 
