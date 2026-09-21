@@ -1,8 +1,12 @@
-# Use lightweight Python image
-FROM python:3.11-slim
+# Python 3.12 has current security support and avoids a stale runtime image.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 # Install system deps for rasterio & GDAL
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gdal-bin \
     libgdal-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -14,10 +18,15 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt
 
 # Copy project files
 COPY . .
+
+# The service has no reason to write application source or run as root.
+RUN groupadd --system app && useradd --system --gid app app \
+    && chown -R app:app /app
+USER app
 
 # Expose FastAPI port
 EXPOSE 8000

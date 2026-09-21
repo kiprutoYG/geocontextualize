@@ -1,8 +1,5 @@
 .env
-__pycache__/
-.agents
+venv/
+.cache/
 .kilocode
-.qwen
 .vscode
-client/.next
-client/node_modules
